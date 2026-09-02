@@ -1,0 +1,106 @@
+# Tag-triggered publish job — the same gap benix-mdns-advertiser's own
+# release.yml closed for itself (slash-builder/benix-mdns-advertiser PR #1,
+# context/projects/benixos.md §9l): ci.yml proves a musl static-PIE binary
+# builds clean, but nothing has ever packaged or published one anywhere.
+# Modeled on that workflow directly, adjusted for this crate's binary name.
+# This repo is small enough to double as its own "-downloads" host (no
+# separate public-download-host split needed, unlike gateway's
+# private-source/public-binary split).
+#
+# **Known, pre-existing limitation, disclosed rather than hidden (matching
+# this repo's own ci.yml/README.md convention for the identical root
+# cause)**: this crate, unlike benix-mdns-advertiser, depends on
+# `fabric-kit` via the private `lockamy` Nexus registry
+# (`.cargo/config.toml`). ci.yml's own two jobs are red on GitHub-hosted
+# `ubuntu-latest` runners specifically because `nexus.softsurve.com` is not
+# reachably fast from those runners' public IPs (see README.md's "What was
+# actually verified" section for the full finding — a Sol-side ingress
+# scoping question, not a defect in this crate's code). This workflow
+# resolves the identical dependency the identical way, so it inherits the
+# identical failure mode on a GitHub-hosted runner today. It is added here
+# anyway (rather than left absent) so it starts working automatically the
+# day that Sol-side reachability gap is closed, without anyone having to
+# remember this crate still needs one. Until then, do not treat a red run
+# of this workflow as a code regression — cross-check against ci.yml's own
+# run history for the same commit first.
+#
+# `meta-benixos`'s fetch-recipe (recipes-connectivity/benix-claim-agent)
+# consumes exactly this release's two assets: the tarball (by name+sha256)
+# and SHA256SUMS (for independent verification during recipe authoring).
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    name: build musl release artifact + publish GitHub Release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install musl cross toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends musl-tools
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Build (musl, release)
+        run: cargo build --release --target x86_64-unknown-linux-musl
+
+      - name: Confirm the binary is actually static (no dynamic libc)
+        # Same `file(1)`-based check as ci.yml's musl job -- `ldd` is not a
+        # trustworthy static/dynamic classifier for a static-PIE ELF (both a
+        # true dynamic binary and a static-PIE one use ET_DYN) -- the exact
+        # bug benix-mdns-advertiser's own CI hit once (see that repo's
+        # commit 62bfa57), fixed there and inherited fixed here.
+        run: |
+          out="$(file -b target/x86_64-unknown-linux-musl/release/benix-claim-agent)"
+          echo "$out"
+          case "$out" in
+            *"statically linked"*|*"static-pie linked"*)
+              echo "Confirmed static." ;;
+            *)
+              echo "Expected a static/static-pie binary, got: $out"
+              exit 1 ;;
+          esac
+
+      - name: Package release artifact
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          stage="$(mktemp -d)"
+          cp target/x86_64-unknown-linux-musl/release/benix-claim-agent "$stage/"
+          cp README.md LICENSE "$stage/"
+          tarball="benix-claim-agent-linux-x64.tar.gz"
+          tar -C "$stage" -czf "$tarball" benix-claim-agent README.md LICENSE
+          sha256sum "$tarball" > SHA256SUMS
+          cat SHA256SUMS
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          echo "TARBALL=$tarball" >> "$GITHUB_ENV"
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          notes="Box-side onboarding claim agent (POST /v1/onboard/claim) static musl binary. Source: ${GITHUB_REPOSITORY}@${GITHUB_SHA}. Platform: linux/x86_64 (static-pie, musl). Unsigned."
+          gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "benix-claim-agent ${GITHUB_REF_NAME}" \
+            --notes "$notes" \
+            "${TARBALL}" \
+            "SHA256SUMS"
