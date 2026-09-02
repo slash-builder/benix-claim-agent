@@ -248,12 +248,45 @@ What was actually run here, not just claimed:
   `musl` CI job runs, executed once here to confirm the workflow as
   written actually passes before it was ever pushed.
 - The GitHub Actions CI in this repo (`.github/workflows/ci.yml`) mirrors
-  all of the above as two jobs (`build`, `musl`) — **not yet confirmed
-  green on GitHub's own runners** as of this writing (the repo was just
-  created; the first push's Actions run is the actual confirmation, same
-  as any new repo's first CI run — check the Actions tab, don't take this
-  README's word for it if they disagree, same caveat the advertiser's own
-  README states for itself).
+  all of the above as two jobs (`build`, `musl`) — **currently RED on
+  GitHub's own runners, and not this crate's own code's fault.** Real
+  finding, checked rather than assumed: both jobs fail identically at
+  dependency resolution —
+  `error: failed to get 'fabric-kit' as a dependency ... unable to update
+  registry 'lockamy' ... download of config.json failed ... transfer too
+  slow: failed to transfer more than 10 bytes in 30s` — i.e.
+  `nexus.softsurve.com` is not reachably fast (effectively unreachable)
+  from GitHub-hosted `ubuntu-latest` runners' public IPs, most likely a
+  Sol-side firewall/security-group scoped to known LAN/VPN source ranges
+  (`softsurve/sol/docs/NETWORK.md` documents `nexus.softsurve.com` as a
+  single-ingress `sol-nginx` proxy on `io`, not obviously open to
+  arbitrary public internet source IPs). **This is not new, and not
+  specific to this repo**: `slash-builder/fabric-kit`'s own GitHub Actions
+  history shows every run failing this exact same way from the moment
+  QR-220 gave that repo its own first `lockamy`-registry dependency
+  (`message-kit`) onward (2026-08-29 21:04 UTC through the latest run
+  checked) — every run before that (when fabric-kit vendored its own
+  proto and touched no private registry) was green. In other words: any
+  repo's GitHub Actions workflow that resolves a `lockamy`-registry crate
+  hits this wall today, including the repo this crate's own dependency
+  comes from. Retried once here (`gh run rerun`) to rule out one-off
+  flakiness — failed identically both times, ruling out a transient
+  blip.
+  **Does not affect the studio's authoritative CI**: Jenkins agents run
+  on Sol's own network (`agent { label 'linux-build' }`) and reach
+  `nexus.softsurve.com` the same way any other on-network Sol service
+  does — this repo's `Jenkinsfile` needs no workaround and should pass
+  there. Routed rather than silently worked around (no vendoring, no
+  disabling the job, no path-dependency substitution): `sol-pm`/
+  `devops-engineer` own whether GitHub's runner IP ranges should be
+  allow-listed on Sol's ingress, or whether this is an accepted,
+  Jenkins-is-authoritative gap for every `lockamy`-registry-consuming
+  repo's GitHub Actions mirror. Every check this crate's own code is
+  responsible for — fmt, clippy, tests, host build, and the musl build's
+  `file(1)` static-PIE classification — is independently proven above,
+  against this crate's actual committed source, in a real container with
+  working registry access; the CI-red status is a network-reachability
+  fact about the runner, not a code defect.
 
 **Not verified, not claimed as done:**
 
