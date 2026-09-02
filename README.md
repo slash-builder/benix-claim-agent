@@ -324,9 +324,17 @@ cargo build --release --target x86_64-unknown-linux-musl   # requires musl-tools
 ```
 
 GitHub Actions (`.github/workflows/ci.yml`) mirrors the studio's primary
-Jenkins pipeline (`Jenkinsfile`) — see both files' own comments for the
-`CARGO_REGISTRIES_LOCKAMY_TOKEN` / Jenkins-credential wiring the private
-registry dependency requires that `benix-mdns-advertiser`'s CI didn't need.
+Jenkins pipeline (`Jenkinsfile`). Unlike `benix-mdns-advertiser`, this
+crate resolves a private-registry dependency (`fabric-kit`, via the
+`lockamy` Nexus registry) — but that needs no secret/credential wiring in
+either CI system: checked before assuming otherwise, the `cargo-group`
+registry's index and crate downloads are unauthenticated reads (confirmed
+with a bare `curl` against both the sparse-index JSON and a crate
+`.crate` download, no `Authorization` header sent, both `200`). A token is
+only needed for `cargo publish`, which this repo doesn't do.
+`slash-builder/fabric-kit`'s own CI confirms the same shape — no
+`secrets.*`/`credentialsId` reference anywhere in its workflow or
+Jenkinsfile either.
 
 ## Open, routed rather than decided here
 
@@ -337,9 +345,7 @@ registry dependency requires that `benix-mdns-advertiser`'s CI didn't need.
 - `data-architect` — `LocalAccountBinding`'s real, locked schema (this
   crate's version is an explicit stand-in — see above).
 - `devops-engineer` — the dinit unit itself, its ordering against network
-  bring-up, the `BENIX_MDNS_PORT` shared-env-var drift risk, and wiring a
-  real `CARGO_REGISTRIES_LOCKAMY_TOKEN` secret into this repo's GitHub
-  Actions.
+  bring-up, and the `BENIX_MDNS_PORT` shared-env-var drift risk.
 - `messaging-architect` + `benixos-pm` — whether `resource_advert`
   publishing eventually lands on this agent (expanded) or a separate
   post-claim daemon; if it's this agent, R1 (keyless) must be revisited

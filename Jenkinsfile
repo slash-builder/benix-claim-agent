@@ -1,10 +1,18 @@
 // benix-claim-agent CI: fmt -> clippy -> test -> build, plus a real musl
 // cross-compile stage. Modeled on benix-mdns-advertiser's own Jenkinsfile
-// shape, with one addition: this crate resolves fabric-kit from the
-// private `lockamy` Nexus registry, so both stages need CARGO_HOME pointed
-// at a directory carrying real registry credentials (Jenkins credential
-// binding, not committed — same pattern fabric-kit's own Jenkinsfile and
-// quickring/gateway's use).
+// shape.
+//
+// This crate resolves fabric-kit from the private `lockamy` Nexus
+// registry (`.cargo/config.toml`, committed — the index URL is not a
+// secret). No credential binding is needed to build/test/clippy against
+// it: checked before assuming otherwise, the `cargo-group` registry's
+// index and crate downloads are unauthenticated reads (confirmed with a
+// bare `curl` against both the sparse-index JSON and a crate .crate
+// download — no `Authorization` header sent, both returned 200). A token
+// is only needed for `cargo publish`, which this repo doesn't do.
+// fabric-kit's own Jenkinsfile confirms the same shape — no
+// `credentialsId`/Nexus-token binding anywhere in it either, and its own
+// Build & Test / musl stages resolve the same registry regardless.
 //
 // No publish stage yet. README.md's "Known gaps" section names this
 // explicitly. Not run for real against this project's actual Jenkins
@@ -16,10 +24,6 @@ def RUST_IMAGE = 'rust:1.90-trixie'
 pipeline {
   agent { label 'linux-build' }
 
-  environment {
-    CARGO_HOME = "${WORKSPACE}/.cargo-home"
-  }
-
   stages {
 
     stage('Pre-flight') {
@@ -30,18 +34,6 @@ pipeline {
             currentBuild.result = 'NOT_BUILT'
             error('Commit contains [skip ci] — aborting.')
           }
-        }
-      }
-    }
-
-    stage('Registry credentials') {
-      steps {
-        withCredentials([string(credentialsId: 'nexus-lockamy-cargo-token', variable: 'LOCKAMY_TOKEN')]) {
-          sh '''
-            mkdir -p "$CARGO_HOME"
-            cp .cargo/config.toml "$CARGO_HOME/config.toml"
-            printf '[registries.lockamy]\ntoken = "%s"\n' "$LOCKAMY_TOKEN" > "$CARGO_HOME/credentials.toml"
-          '''
         }
       }
     }

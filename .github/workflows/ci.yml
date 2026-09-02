@@ -4,11 +4,18 @@
 # workflow runs the same checks on every push and PR so a contributor
 # without internal Jenkins access still gets a green/red signal.
 #
-# Unlike the advertiser, this crate depends on a private registry crate
-# (fabric-kit, via the `lockamy` Nexus registry) — both jobs below need a
-# `CARGO_REGISTRIES_LOCKAMY_TOKEN` secret to resolve it. `.cargo/config.toml`
-# in this repo defines WHERE the registry is (not a secret, committed); the
-# token itself is never committed.
+# Unlike the advertiser, this crate depends on a private-registry crate
+# (fabric-kit, via the `lockamy` Nexus registry) — `.cargo/config.toml` in
+# this repo defines WHERE that registry is (not a secret, committed).
+# Checked before assuming otherwise: the `cargo-group` registry's index and
+# crate downloads are unauthenticated reads (confirmed with a bare `curl`
+# against both the sparse-index JSON and a crate .crate download, no
+# credentials sent) — a token is only needed for `cargo publish`, which
+# this repo doesn't do. fabric-kit's own CI (`slash-builder/fabric-kit/
+# .github/workflows/ci.yml`, `Jenkinsfile`) confirms the same thing: no
+# `secrets.*`/`credentialsId` reference anywhere in either, and its build/
+# clippy/test steps run there against the same registry regardless. No
+# secret wiring needed here either, so none is added.
 #
 # Does not publish anything yet — see README.md's "Known gaps" section.
 
@@ -26,7 +33,6 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  CARGO_REGISTRIES_LOCKAMY_TOKEN: ${{ secrets.CARGO_REGISTRIES_LOCKAMY_TOKEN }}
 
 jobs:
 
