@@ -1,0 +1,105 @@
+[package]
+name = "benix-claim-agent"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "BenixOS box-side claim agent: box-local identity/state-machine core plus the LAN onboarding endpoint (POST /v1/onboard/claim) Courier delivers a hub-issued qr_payload to. Depends on fabric-kit for the Hearth TPair(CLAIM) wire primitive; does not hand-roll pairing or wire logic."
+repository = "https://github.com/slash-builder/benix-claim-agent"
+keywords = ["benixos", "pairing", "onboarding", "hearth"]
+categories = ["network-programming"]
+
+# Placement follows benix-mdns-advertiser's Tier-2 precedent exactly
+# (context/projects/benixos.md §9j, dispatched by benixos-pm 2026-09-02):
+# this crate's dependency graph (axum, fabric-kit, tokio) is pure Rust with
+# no C-lib/D-Bus dependency, so it belongs in its own small repo, built via
+# its own CI to a static musl release artifact — not vendored as in-tree
+# Yocto recipe source in slash-builder/core. A meta-benixos dinit unit +
+# BitBake recipe that fetches the prebuilt binary comes later, sequenced
+# after this exists (out of scope for this pass — see README.md).
+#
+# musl-buildability was the one open risk this contract flagged (fabric-kit
+# is heavier than the advertiser's dependency set: ed25519-dalek + hpke
+# (which pulls in x25519-dalek transitively — NOT a direct fabric-kit
+# dependency, correcting the dispatch brief's phrasing) + tokio-tungstenite
+# with rustls-tls-webpki-roots, i.e. pure-Rust TLS, no system OpenSSL).
+# Spiked BEFORE writing any of this crate's own code, against a minimal
+# throwaway crate depending on fabric-kit via a path dependency, built with
+# `cargo build --release --target x86_64-unknown-linux-musl` inside a
+# `rust:1.90-trixie` container (musl-tools installed, target added) — the
+# same image/toolchain shape benix-mdns-advertiser's own Jenkinsfile uses.
+# Result: **clean pass.** `file(1)` classified the resulting binary
+# `ELF 64-bit LSB pie executable, x86-64, ... static-pie linked` — the same
+# positive classification benix-mdns-advertiser's CI treats as proof, not
+# `ldd` (this crate's own musl CI job below inherits that fixed check, not
+# the buggy one). See README.md's "What was actually verified" section for
+# the full spike record.
+
+[[bin]]
+name = "benix-claim-agent"
+path = "src/main.rs"
+
+[dependencies]
+# HTTP listener — matches this studio's existing stack in qr-gateway/qr-web
+# (gateway/crates/qr-web/Cargo.toml pins "0.7"); deliberately not a
+# different web framework.
+axum = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal"] }
+# select_all over the per-interface listener tasks in main.rs. Already
+# present in fabric-kit's own dependency tree (proven musl-clean above).
+futures-util = "0.3"
+
+# Hearth pairing primitive (QR-48-50/QR-53/QR-231, F7 sealing) — depended on
+# as a library, not reimplemented. `pair_claim`/`PendingPairing::
+# wait_for_result` are the exact functions this crate calls; see
+# src/pairing.rs. Registry (not path), matching quickring/gateway's own
+# `fabric-kit = { version = "0.1", registry = "lockamy" }` declaration —
+# the same published crate, same pin shape, not a fork.
+fabric-kit = { version = "0.1", registry = "lockamy" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Query-string parsing for the `quickring://pair?session=...&endpoint=...`
+# grammar (verified against quickring/hub/src/pairing.rs::create_session,
+# see src/qr_payload.rs). Pure Rust (icu4x/idna_adapter under the hood, no
+# C deps) and already transitively present in fabric-kit's own dependency
+# tree (pulled in via message-kit/hub-adjacent crates) — not a new
+# musl-risk surface, confirmed compiling clean in the same spike above.
+url = "2"
+
+# LAN-interface enumeration for the explicit non-0.0.0.0 bind (see
+# src/net.rs) — same idiom precedent benix-mdns-advertiser's README points
+# at (`mdns-sd`'s own auto-address-detection) but this crate has no mdns-sd
+# dependency of its own, so it uses if-addrs directly, as the README's
+# alternative explicitly allows. Pure Rust, no C libs.
+if-addrs = "0.13"
+
+hostname = "0.4"
+
+# Persisted Ed25519 identity seed / pair-credentials / local-account-binding
+# on disk (see src/state.rs). Deliberately no database, no config file —
+# matching benix-mdns-advertiser's own state-dir convention.
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Hex encoding for persisted binary fields (resume_token, sealing keypair
+# seed) in src/state.rs's on-disk PairCredentials shape. Already present in
+# fabric-kit's own dependency tree (proven musl-clean in the spike above).
+hex = "0.4"
+
+# The seam between this crate and fabric-kit's pair_claim/wait_for_result
+# calls (src/pairing.rs) — a trait object boundary so unit tests can
+# exercise the PairOutcome::Approved/Rejected/Timeout state transitions
+# without a live or mock-transport-level hub connection. Already present in
+# fabric-kit's own dependency tree.
+async-trait = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+tower = { version = "0.4", features = ["util"] }
+http-body-util = "0.1"
+
+[profile.release]
+lto = "thin"
+strip = true

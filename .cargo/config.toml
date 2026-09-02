@@ -1,0 +1,9 @@
+# Cargo registry config — defines where the `lockamy` registry is (fabric-kit
+# is consumed from it, see Cargo.toml). Same pattern as fabric-kit's own
+# repo-root config.toml and quickring/gateway's — the index URL is not a
+# secret; the token lives in cargo credentials
+# (~/.cargo/credentials.toml locally, or written by CI) and is never
+# committed.
+
+[registries.lockamy]
+index = "sparse+https://nexus.softsurve.com/repository/cargo-group/"
