@@ -129,11 +129,73 @@ implemented honestly on the target hardware). Displayed as unpadded
 Crockford Base32, grouped `XXXXX-XXXXX-XXXXX-XXXXX-XXXXXX` (26 chars) —
 case-insensitive, `I`/`L`/`O` collision-free by construction, and tolerant
 of `O`→`0`/`I`,`L`→`1` substitution on decode (Crockford's own documented
-leniency). On startup, an **unclaimed** box prints this code to stdout
-(`src/render.rs`'s `display_claim_code` — a `render` seam, not the final
-display renderer; dinit already routes stdout to console/serial today, per
-§9h — a production unit's physical LCD or a QR/framebuffer path is later,
-separate work that only needs to implement this same seam differently).
+leniency). On startup, an **unclaimed** box prints the full claim screen
+(see below) to stdout (`src/render.rs`'s `display_claim_code` — a `render`
+seam, not the final display renderer; dinit already routes stdout to
+console/serial today, per §9h and §9pp's real 160x50 framebuffer capture —
+a production unit's physical LCD is later, separate work that only needs to
+implement this same seam differently).
+
+### The claim screen: QR + text code (`src/render.rs`, `src/qr.rs`, §9rr)
+
+An unclaimed box's console shows a header, a scannable QR code, the same
+secret as grouped Crockford Base32 text, and a one-line instruction —
+[`render::build_claim_screen`] is a **pure function of the display code
+string** (no I/O, no protocol state), so the composition is unit-tested
+without a console; `render::display_claim_code` is the thin `println!`
+wrapper that actually reaches stdout.
+
+The QR itself is rendered as Unicode half-block text (`▀`/`▄`/`█`, 2 QR
+modules packed per character row — the standard terminal-QR technique) by
+`src/qr.rs`, using the `qrcode` crate (`default-features = false`) — a real
+`cargo tree` spike confirmed this adds **zero** transitive dependencies
+with `image`/`svg`/`pic` disabled, so it does not enlarge this crate's
+musl-risk surface at all. `fast_qr` was the named fallback if `qrcode` had
+turned out to be heavy; it isn't, so there was no reason to reach for it.
+For this crate's actual payload length the QR renders as a 37×19-character
+block — comfortably inside the 160×50 console §9pp's real capture
+confirmed.
+
+**QR payload format — invented here, not specified by §9hh, NEEDS
+MESSAGING-ARCHITECT RATIFICATION before any Courier-side consumer treats it
+as settled:**
+
+```
+benix-claim://v1?s=<26-character-Crockford-Base32-secret, ungrouped>
+```
+
+§9hh's own design text scopes "QR bitmap rendering" as a *display* concern
+and specifies no QR wire format for the local-only claim flow — this format
+is this implementation's own choice, versioned (`v1`) so it's cheap to
+change later, carrying only the secret (nothing about `challenge_id`,
+`box_pubkey`, or the transcript rides the QR; that's all negotiated over
+the existing two-message handshake exactly as it would be for a
+manually-typed code). The *old*, superseded hub-mediated flow's
+`quickring://pair?session=...&endpoint=...` grammar (`src/qr_payload.rs`)
+was read for format convention only, per this task's explicit instruction
+not to couple to a flow §9gg demoted — it carries a hub session id, not a
+claim secret, and is a different shape for a different purpose. See
+`src/render.rs`'s own doc comment for the full rationale; the same callout
+is in this PR's description.
+
+**Gating**: the claim screen is built and printed exactly once, at process
+startup, only when `state::is_claimed()` is false — the same gate the
+plain-text code already used. A claimed box never renders it (the secret
+is deleted from disk on claim anyway — `state::delete_claim_secret`). If
+QR rendering itself ever fails (not expected for this crate's short,
+fixed-shape payload), the screen degrades gracefully to text-only rather
+than losing the whole screen.
+
+**Named follow-up, NOT built in this repo (`slash-builder/core`'s
+concern): tty ownership.** DJ's own VM 260 screenshot (§9pp) shows a getty
+already running on tty1 — a `println!` from this dinit-supervised service
+and the login prompt will interleave on the same console today. The real
+fix is a dinit-level decision in `slash-builder/core`'s
+`dinit-benixos-services`, not a change to this crate: for example, a
+`benix-claim-screen` dinit service that owns tty1 gated on unclaimed state
+(with `getty` moved to tty2, or started on tty1 only after claim). This PR
+implements the render + startup print; it does not attempt to fix tty
+ownership from here.
 
 ### The wire contract (`src/local_claim.rs`)
 
@@ -300,11 +362,15 @@ construction.
   NOT hold the household content key and MUST NOT issue `/keys/request`.
   Its scope is pairing (identity + sealing keys) and `LocalAccountBinding`
   only. Nothing content-key-adjacent lives in this crate.
-- **No fingerprint rendering, no QR rendering.** The local-claim protocol's
-  `src/render.rs` prints the plain-text code to stdout (a real `render`
-  seam, per §9hh Item 1) — a QR bitmap or physical-LCD renderer for
-  production hardware is separate, later display-layer work that
-  implements the same seam differently, not a protocol change.
+- **No fingerprint rendering.** Text-mode QR rendering now exists (§9rr,
+  see "The claim screen" above) — a physical-LCD renderer for production
+  hardware, or a fingerprint-comparison display for the deferred Hearth-join
+  step, is separate, later display-layer work that implements the same
+  `render` seam differently, not a protocol change.
+- **No tty-ownership fix.** The claim screen prints to stdout at startup;
+  it does not arbitrate against a getty already on the same console tty.
+  Named explicitly as `slash-builder/core`'s follow-up — see "The claim
+  screen" above.
 - **No owner-signature authentication mechanism.** §9ii R4 requires — and
   this PR implements — that the demoted `/v1/onboard/claim` cannot
   establish ownership on an *unclaimed* box. It does NOT yet verify the
@@ -501,9 +567,61 @@ established verification environment):
   ad hoc Docker pull. Flagged for whoever next touches this crate's musl
   job, not fixed here.
 
+### This pass's own verification (claim screen QR, §9rr)
+
+Same discipline, same environment (`rust:1.90-trixie` container via local
+Docker, matching the Jenkinsfile's `Build & Test`/`musl cross-compile`
+stages exactly, including the `-u root:root` fix from PR #2 for the
+`apt-get` stage):
+
+- **Dependency spike, run before adding `qrcode` to `Cargo.toml`**: a
+  throwaway crate depending on `qrcode = { version = "0.14",
+  default-features = false }` was built with `cargo tree` — confirmed
+  **zero** additional transitive dependencies (the default `image`/`svg`/
+  `pic` features are the only feature-gated parts of that crate; the
+  `render::unicode` module used here is not gated). Checked, not assumed.
+- `cargo fmt --check` — clean (one formatting fix applied after the first
+  run).
+- `cargo clippy --all-targets -- -D warnings` — clean, zero warnings (one
+  unused-import fixed after the first run).
+- `cargo test` — **79/79 passing (up from 68; 11 new tests)**: 5 in `qr.rs`
+  (determinism, distinct payloads render distinctly, the 160×50 console fit
+  with a pinned 37×19 regression size, glyph-set restriction, an empty-
+  payload edge case) and 6 in `render.rs` (the claim-URI's versioned
+  scheme/separator-stripping, a round trip through `secret::decode`,
+  distinct secrets producing distinct URIs, the full claim screen
+  containing the header/code/QR, the screen composer being a pure function
+  of its input, and distinct codes producing distinct screens). Zero
+  regressions in the existing 68.
+- `cargo build --release` — clean.
+- **`cargo build --release --target x86_64-unknown-linux-musl` — attempted,
+  did NOT succeed in this session's container, for the exact same
+  pre-existing, already-disclosed reason as the §9hh/§9ii pass above:**
+  `ring` (an existing transitive TLS dependency this PR does not touch)
+  fails to compile its C sources because this pull of `rust:1.90-trixie`'s
+  `musl-gcc`/`cc1` rejects `-m64`. **Confirmed NOT a regression this PR
+  introduces**: re-ran the identical build against the untouched baseline
+  commit (`21bae64`, via a separate `git worktree`, before concluding
+  anything) and got the byte-identical failure. This crate's own new
+  dependency (`qrcode`) is pure Rust with zero C-compilation surface, so it
+  cannot be the cause. Same disposition as before: not chased further here
+  (a floating-Docker-tag toolchain issue, not code-side), flagged for
+  whoever next touches this crate's musl job, and not blocking on the
+  studio's authoritative Jenkins, which this session cannot reach to
+  cross-check directly (`jenkins.softsurve.com` returns an auth-required
+  page from this environment).
+- GitHub Actions (`ci.yml`): this repo's own CI history shows every run on
+  `main` red since before this PR, for the already-documented,
+  unrelated-to-code reason above ("What was actually verified" —
+  `nexus.softsurve.com` unreachable from GitHub-hosted runners). Checked
+  via `gh run list` before assuming this PR's own run would be any
+  different; it is not expected to turn the mirror green, and a red run on
+  this PR should be cross-checked against that pre-existing pattern before
+  being read as a regression.
+
 ## Test coverage
 
-`cargo test` — 68 tests, all passing as of this writing:
+`cargo test` — 79 tests, all passing as of this writing:
 
 - `qr_payload`: the exact hub grammar (real-shaped payload, `wss://`
   production-style, param-order independence, extra-field tolerance) and
@@ -577,6 +695,22 @@ established verification environment):
     `pair-credentials`/`local-account-binding` **only** on
     `PairOutcome::Approved`, and leaves the box unclaimed on `Rejected`,
     `Timeout`, and a `wait_for_result` `Err`.
+- `qr` (§9rr, the text-mode QR primitive): the same payload renders
+  identically every time (determinism, not eyeballed), two different
+  payloads render differently, the rendered block's glyph set is restricted
+  to exactly the four expected characters (`▀`/`▄`/`█`/space), an empty
+  payload still encodes without panicking, and — a pinned regression, not
+  just a bound — this crate's actual claim-URI length renders to exactly
+  37×19 characters, comfortably inside the 160×50 console §9pp confirmed.
+- `render` (§9rr, the claim-screen composer): the claim URI carries the
+  versioned `benix-claim://v1?s=` prefix and strips the display code's `-`
+  group separators; the embedded compact secret round-trips through
+  `secret::decode` to the exact same bytes the grouped display string does;
+  different secrets produce different URIs; the full composed screen
+  contains the header, the grouped code, the word "Courier", and at least
+  one real QR glyph (proving the QR is genuinely embedded, not silently
+  skipped); the composer is a pure function (same input twice → identical
+  output); and different codes produce different screens.
 
 ## Build & CI
 
