@@ -52,7 +52,14 @@ pipeline {
     }
 
     stage('musl cross-compile') {
-      agent { docker { image RUST_IMAGE; reuseNode true } }
+      // args '-u root:root' -- confirmed live, 2026-09-04: Jenkins' Docker
+      // Pipeline plugin runs `docker { }` agent-block containers as a fixed
+      // non-root UID (5005), so `apt-get update`/`install` below fails with
+      // "Permission denied" on /var/lib/apt/lists/lock without this. Same
+      // real bug found and fixed the same way tonight in
+      // slash-builder/benix-mdns-advertiser and slash-builder/storage-kit --
+      // this is the third repo in this kit-repo family hitting it.
+      agent { docker { image RUST_IMAGE; reuseNode true; args '-u root:root' } }
       steps {
         sh '''
           apt-get update -qq
