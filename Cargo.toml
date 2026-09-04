@@ -1,6 +1,6 @@
 [package]
 name = "benix-claim-agent"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "BenixOS box-side claim agent: box-local identity/state-machine core plus the LAN onboarding endpoint (POST /v1/onboard/claim) Courier delivers a hub-issued qr_payload to. Depends on fabric-kit for the Hearth TPair(CLAIM) wire primitive; does not hand-roll pairing or wire logic."
