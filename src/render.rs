@@ -1,16 +1,54 @@
 //! The claim-code display seam — deliberately named "a `render` seam, not
 //! the final display renderer" in §9hh's own implementation spec
-//! (`context/projects/benixos.md`). Today this is exactly one function that
-//! prints to stdout, because dinit already routes this process's stdout to
-//! the box's console/serial output (§9h; VM 260's own `qm terminal`/
-//! `-serial` side-channel already proves this text path works, no new
-//! engineering needed for the dev/VM case, and §9pp's real framebuffer
-//! capture confirms a genuine 160x50 text console on the actual VGA path).
-//! A production unit's physical LCD is a *display* concern, not a
-//! *protocol* concern (§9gg item 1) — swapping one in later means giving
-//! [`display_claim_code`] a different body (or adding a second
-//! implementation this module dispatches to), not touching `secret.rs` or
-//! `local_claim.rs` at all.
+//! (`context/projects/benixos.md`). A production unit's physical LCD is a
+//! *display* concern, not a *protocol* concern (§9gg item 1) — swapping
+//! one in later means giving [`display_claim_code`] a different body (or
+//! adding a second implementation this module dispatches to), not
+//! touching `secret.rs` or `local_claim.rs` at all.
+//!
+//! ## tty1 visibility (§9rr follow-up, closed here)
+//!
+//! §9rr shipped this screen as a plain `println!` to stdout, reasoning
+//! that "dinit already routes this process's stdout to the box's
+//! console/serial output". That reasoning does not survive contact with
+//! VM 260's real kernel cmdline (`console=tty0,115200n8
+//! console=ttyS0,115200n8`, PR #28): userspace writes to `/dev/console`
+//! are a real Linux kernel behavior, not a dinit or BenixOS quirk — they
+//! only ever reach the kernel's one "preferred console" device, which is
+//! the *last* `console=` entry (`ttyS0`, the serial port), regardless of
+//! how many earlier entries also receive kernel `printk` output. Whatever
+//! dinit's own `benix-claim-agent` service unit does with this process's
+//! stdout (today, nothing — no `logfile`/`log-type` directive is set on
+//! that unit, and dinit's own documented default is `log-type = none`,
+//! i.e. the output is silently discarded; see
+//! `slash-builder/core`'s `dinit-benixos-services/services/dockerd` for
+//! the identical, already-diagnosed default-discard behavior on a
+//! different service), a bare `println!` was never going to reach the
+//! framebuffer VT (`tty1`) DJ's own §9pp/§9qq screenshots confirm is the
+//! screen an operator actually looks at.
+//!
+//! The fix: [`display_claim_code`] now writes directly to a configurable
+//! tty device node (`BENIX_CLAIM_TTY`, default [`DEFAULT_CLAIM_TTY`]) via
+//! a plain `OpenOptions::write` — bypassing dinit's stdout routing (or
+//! lack thereof) and the kernel's `/dev/console` last-entry-wins
+//! resolution entirely. If that open/write fails for any reason (the
+//! device doesn't exist — every non-BenixOS dev machine and this crate's
+//! own CI containers, permission denied, etc.), it falls back to the
+//! original `println!` to stdout, so nothing here can turn a missing
+//! `/dev/tty1` into a startup failure or a lost test run.
+//!
+//! **Named, not solved here**: dinit's own `tty1` unit
+//! (`slash-builder/core`'s `dinit-benixos-services/services/tty1`) starts
+//! an `agetty` login prompt on the same device independently of this
+//! process, and nothing coordinates the two — this round's fix is
+//! deliberately pragmatic coexistence (see [`crate::config::Config::
+//! claim_screen_delay_ms`]'s doc comment: a short startup delay so the
+//! claim screen lands *after* agetty's own prompt rather than racing it,
+//! not proper ownership arbitration), matching the scope this task
+//! explicitly set. The clean fix — a dinit-level `benix-claim-screen`
+//! service that owns `tty1` while unclaimed, with `getty` moved to
+//! `tty2` — is `slash-builder/core`'s follow-up, tracked as task #64, not
+//! attempted from this repo.
 //!
 //! ## §9rr: the claim screen (QR + text code)
 //!
@@ -22,8 +60,7 @@
 //! console, kept separate for exactly the same "pure function vs. I/O"
 //! split `secret.rs`/`local_claim.rs` already draw elsewhere in this crate.
 //!
-//! ### QR payload format — INVENTED HERE, NOT SPECIFIED BY §9hh, NEEDS
-//! MESSAGING-ARCHITECT RATIFICATION
+//! ### QR payload format — RATIFIED, §9ss
 //!
 //! §9hh's own design text scopes "QR bitmap rendering" as a *display*
 //! concern, explicitly out of the protocol it defines, and specifies no QR
@@ -33,7 +70,7 @@
 //! *convention*, deliberately not reused or coupled to here, since §9gg
 //! demoted that flow and it carries a hub session id, not a claim secret).
 //!
-//! In the absence of a specified format, this module defines one:
+//! In that absence, this module defined one:
 //!
 //! ```text
 //! benix-claim://v1?s=<26-character-Crockford-Base32-secret>
@@ -54,16 +91,60 @@
 //!   two-message handshake in `src/local_claim.rs` exactly as it would be
 //!   for a manually-typed code.
 //!
-//! **This format is this implementation's own choice, not a ratified
-//! contract.** It is deliberately simple and versioned so it's cheap to
-//! change. Flagging explicitly, per this project's own discipline (§9hh/
-//! §9ii's design-then-review precedent): **a Courier-side implementer
-//! should not treat this scheme as settled until messaging-architect signs
-//! off on it** — see the PR this lands in for the same callout.
+//! **messaging-architect's binding ratification** (`context/projects/
+//! benixos.md` §9ss, verdict: RATIFIED WITH NAMED BINDING ADDITIONS): the
+//! emitted string above is unchanged — every addition is a parser-side
+//! rule, nothing this crate emits is affected. The two binding rules a
+//! Courier-side parser MUST follow, so this format stays cheap to evolve
+//! without a version bump for every addition:
+//!
+//! 1. **Unknown query params MUST be ignored.** Mirrors
+//!    `qr_payload.rs`'s own existing "additive/unknown field" tolerance —
+//!    makes an optional future field (e.g. an mDNS-`id` correlation hint,
+//!    named in §9ss Q2 as the only acceptable shape for one, advisory
+//!    only, never a raw IP) an additive, non-breaking change.
+//! 2. **Additive fields need no version bump; breaking changes go to a new
+//!    `v2` authority.** `v1` stays reserved for this exact shape.
 
 /// The QR payload scheme/version prefix — see this module's own doc comment
 /// for why this exists and its ratification status.
 const CLAIM_URI_PREFIX: &str = "benix-claim://v1?s=";
+
+/// Overrides which device [`display_claim_code`] writes the claim screen
+/// to — see this module's "tty1 visibility" doc section above. Tests
+/// point this at a throwaway regular file rather than a real tty device;
+/// `OpenOptions::write` has no tty-specific behavior, so a regular file
+/// exercises the exact same code path a real `/dev/tty1` open would.
+const CLAIM_TTY_ENV_VAR: &str = "BENIX_CLAIM_TTY";
+
+/// Default target: the local framebuffer VT — the screen §9pp/§9qq's
+/// framebuffer-console work made real and DJ's own screenshot confirms is
+/// what an operator actually looks at. Deliberately NOT `/dev/console`
+/// (see this module's doc comment for why that resolves to the serial
+/// port on this box's real kernel cmdline) and NOT a `BENIX_CLAIM_STATE_DIR`-relative
+/// path (this is a device node, not persisted state).
+const DEFAULT_CLAIM_TTY: &str = "/dev/tty1";
+
+/// Resolve the tty device path to write the claim screen to, honoring
+/// [`CLAIM_TTY_ENV_VAR`] with a documented default — same env-var-with-
+/// default idiom `config.rs` uses everywhere else in this crate.
+fn claim_tty_path() -> std::path::PathBuf {
+    std::env::var(CLAIM_TTY_ENV_VAR)
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from(DEFAULT_CLAIM_TTY))
+}
+
+/// Open `path` for writing and write `screen` to it — no tty-specific
+/// logic at all, just a plain, unbuffered write-and-flush. Split out from
+/// [`display_claim_code`] so the open/write/fallback decision is a single,
+/// pure `Result`-returning step, independent of the `println!` fallback
+/// that decision drives.
+fn write_screen_to_device(path: &std::path::Path, screen: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut device = std::fs::OpenOptions::new().write(true).open(path)?;
+    device.write_all(screen.as_bytes())?;
+    device.flush()
+}
 
 /// Build this box's claim URI from its human-readable display code (the
 /// grouped, 26-character Crockford Base32 string from
@@ -128,15 +209,39 @@ pub fn build_claim_screen(display_code: &str) -> String {
 /// console. Called exactly once, at startup, only while the box is
 /// unclaimed (see `main.rs`) — a claimed box has nothing left to display.
 ///
-/// Uses `println!` rather than `tracing::info!` deliberately: this is a
-/// user-facing instruction, not a diagnostic log line, and must reach the
-/// console regardless of `RUST_LOG`'s configured level.
+/// Writes directly to the configured tty device
+/// ([`CLAIM_TTY_ENV_VAR`]/[`DEFAULT_CLAIM_TTY`] — see this module's "tty1
+/// visibility" doc section) rather than relying on this process's stdout
+/// being routed anywhere useful. Falls back to a plain `println!` if that
+/// open/write fails for any reason (device absent, permission denied,
+/// not a BenixOS box at all) — this function can never turn a missing tty
+/// device into a startup failure, and the fallback preserves this crate's
+/// original §9kk/§9rr behavior for tests and non-BenixOS environments.
+/// Either way this is a user-facing instruction, not a diagnostic log
+/// line: it must reach its destination regardless of `RUST_LOG`'s
+/// configured level, so it never goes through `tracing::info!` — only the
+/// *decision* of which path was taken is logged, via `tracing`, at
+/// whichever level fits (`info` on success, `warn` on fallback).
 ///
 /// A thin wrapper around [`build_claim_screen`] — see that function for the
 /// actual, unit-tested composition; this one only exists to perform the
-/// `println!` I/O.
+/// I/O.
 pub fn display_claim_code(code: &str) {
-    println!("{}", build_claim_screen(code));
+    let screen = build_claim_screen(code);
+    let tty_path = claim_tty_path();
+    match write_screen_to_device(&tty_path, &screen) {
+        Ok(()) => {
+            tracing::info!(tty = %tty_path.display(), "wrote claim screen to console device");
+        }
+        Err(error) => {
+            tracing::warn!(
+                tty = %tty_path.display(),
+                %error,
+                "failed to write claim screen to configured tty device, falling back to stdout"
+            );
+            println!("{screen}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -209,5 +314,55 @@ mod tests {
         let a = build_claim_screen(&encode_display(&[0x11; 16]));
         let b = build_claim_screen(&encode_display(&[0x22; 16]));
         assert_ne!(a, b);
+    }
+
+    /// Both the success path (a writable stand-in device) and the
+    /// fallback path (an unwritable one) in a single test function,
+    /// deliberately — `BENIX_CLAIM_TTY` is process-global state, and
+    /// `cargo test` runs tests in parallel by default, so two separate
+    /// tests each setting/clearing the same env var would race each other
+    /// (the same isolation concern `config.rs`'s own env-var test already
+    /// names for its own vars).
+    #[test]
+    fn display_claim_code_writes_to_configured_tty_and_falls_back_on_failure() {
+        // Default: unset entirely resolves to /dev/tty1 — checked first,
+        // before this test touches the env var at all, so it can't race
+        // any other test that might also read/clear BENIX_CLAIM_TTY.
+        std::env::remove_var(CLAIM_TTY_ENV_VAR);
+        assert_eq!(claim_tty_path(), std::path::PathBuf::from("/dev/tty1"));
+
+        // Success: OpenOptions::write has no tty-specific behavior, so a
+        // plain regular file exercises the exact same open/write/flush
+        // path a real /dev/tty1 would.
+        let stand_in = std::env::temp_dir().join(format!(
+            "benix-claim-agent-test-tty-{}-{}",
+            std::process::id(),
+            "success"
+        ));
+        std::fs::write(&stand_in, b"").expect("create stand-in tty file");
+        std::env::set_var(CLAIM_TTY_ENV_VAR, &stand_in);
+
+        let display = encode_display(&SAMPLE_SECRET);
+        display_claim_code(&display);
+
+        let written = std::fs::read_to_string(&stand_in).expect("read stand-in tty file");
+        assert!(
+            written.contains(&display),
+            "claim screen must have been written to the configured tty path"
+        );
+        let _ = std::fs::remove_file(&stand_in);
+
+        // Fallback: a path whose parent directory doesn't exist can never
+        // be opened for writing — must not panic, must silently fall back
+        // to println! instead (this crate's original §9kk/§9rr behavior,
+        // and the default posture for every non-BenixOS environment,
+        // including this very test run, when BENIX_CLAIM_TTY is unset).
+        std::env::set_var(
+            CLAIM_TTY_ENV_VAR,
+            "/nonexistent-dir-benix-claim-agent-test-should-never-exist/tty1",
+        );
+        display_claim_code(&display);
+
+        std::env::remove_var(CLAIM_TTY_ENV_VAR);
     }
 }

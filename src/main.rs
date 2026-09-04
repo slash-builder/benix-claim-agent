@@ -204,7 +204,20 @@ async fn main() {
     // §9gg/§9hh: a factory-fresh, unclaimed box shows its secret on
     // startup — the `render` seam (see `src/render.rs`), not the final
     // display renderer. A claimed box has nothing left to display.
+    //
+    // §9rr's tty1-visibility follow-up: a short, configurable delay
+    // (`BENIX_CLAIM_SCREEN_DELAY_MS`, see `config.rs`) before writing,
+    // so this doesn't race dinit's own `tty1` getty for the same device
+    // — pragmatic coexistence for this round (interleaving is acceptable
+    // per the task that added this), not the clean dinit-level ownership
+    // arbitration named as `slash-builder/core`'s follow-up (task #64).
     if !already_claimed {
+        if config.claim_screen_delay_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(
+                config.claim_screen_delay_ms,
+            ))
+            .await;
+        }
         render::display_claim_code(&secret::encode_display(&secret));
     }
 
