@@ -43,6 +43,7 @@ mod local_account_binding;
 mod local_claim;
 mod net;
 mod pairing;
+mod qr;
 mod qr_payload;
 mod ratelimit;
 mod render;

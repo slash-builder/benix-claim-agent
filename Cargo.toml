@@ -132,6 +132,25 @@ ed25519-dalek = "2"
 # adding `base64` itself, not reusing what's already there.
 data-encoding = "2"
 
+# --- Claim-screen QR rendering (context/projects/benixos.md §9rr) ---
+# Text-mode QR rendering for the unclaimed-box console screen (src/qr.rs).
+# This IS a genuinely new dependency — not an existing-transitive promotion
+# like the four above — so it gets its own justification.
+#
+# `qrcode` 0.14, `default-features = false`: inspected against a real
+# throwaway spike before adding it here (`cargo tree` against a fresh
+# crate depending on `qrcode = { version = "0.14", default-features =
+# false }`) — with the default `image`/`svg`/`pic` features off, this pulls
+# in **zero** additional crates; the `render::unicode::Dense1x2` renderer
+# (half-block `▀`/`▄`/`█` text output, 2 QR modules per character row) is
+# not itself feature-gated, only `render::image` is
+# (`#![cfg(feature = "image")]` in that submodule specifically). Pure Rust,
+# no C deps, confirmed building for `x86_64-unknown-linux-musl` locally
+# before this dependency was committed — see README's "What was actually
+# verified" section. `fast_qr` was the named alternative if this dragged in
+# something heavy; it did not, so there was no reason to reach for it.
+qrcode = { version = "0.14", default-features = false }
+
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 tower = { version = "0.4", features = ["util"] }
