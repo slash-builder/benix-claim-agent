@@ -352,6 +352,8 @@ construction.
 | `BENIX_CLAIM_STATE_DIR` | `/var/lib/benixos` | State directory (now created `0700`, per §9ii R5). Distinct var name from the advertiser's `BENIX_MDNS_STATE_DIR`; same default path is fine — different filenames underneath (`device-key`, `claimed`, `pair-credentials`, `local-account-binding`, and now `claim-secret` — the local-only claim protocol's secret, wiped on claim). |
 | `BENIX_CLAIM_RATE_LIMIT_PER_MIN` | `10` | Per-source-IP token-bucket budget, shared by every claim route (local-claim and the demoted hub-mediated one alike). |
 | `BENIX_CLAIM_DEVICE_NAME` | this box's hostname | The `proposed_device_name` sent to the hub at claim time (hub-mediated path only). |
+| `BENIX_CLAIM_TTY` | `/dev/tty1` | (tty1-visibility fix, this pass) Device node `display_claim_code` writes the claim screen to. Falls back to `println!`/stdout if the open/write fails for any reason (not a BenixOS box, permission denied, device absent). |
+| `BENIX_CLAIM_SCREEN_DELAY_MS` | `1500` | (tty1-visibility fix, this pass) Startup delay before writing the claim screen, so it lands after (not racing) dinit's own `tty1` `agetty` login prompt. `0` disables the delay. Pragmatic coexistence, not real ownership arbitration — see "The claim screen" below. |
 | `RUST_LOG` | `info` | Standard `tracing-subscriber` env filter. |
 
 ## Explicitly out of scope for this pass
@@ -367,10 +369,17 @@ construction.
   hardware, or a fingerprint-comparison display for the deferred Hearth-join
   step, is separate, later display-layer work that implements the same
   `render` seam differently, not a protocol change.
-- **No tty-ownership fix.** The claim screen prints to stdout at startup;
-  it does not arbitrate against a getty already on the same console tty.
-  Named explicitly as `slash-builder/core`'s follow-up — see "The claim
-  screen" above.
+- **No tty-ownership arbitration** (pragmatic coexistence only, this
+  pass). The claim screen now writes directly to `/dev/tty1` (see
+  `BENIX_CLAIM_TTY`/`BENIX_CLAIM_SCREEN_DELAY_MS` above and `render.rs`'s
+  "tty1 visibility" module doc) instead of a plain `println!` that
+  §9rr's own reasoning about dinit's console routing did not actually
+  reach anywhere — but it still does not *arbitrate* against `agetty`
+  already running on that same device; a short startup delay just makes
+  the two land in a fixed, non-racing order, and interleaving is
+  accepted. The clean fix — a dinit-level `benix-claim-screen` service
+  that owns `tty1` while unclaimed, with `getty` moved to `tty2` — is
+  still `slash-builder/core`'s follow-up (task #64), not attempted here.
 - **No owner-signature authentication mechanism.** §9ii R4 requires — and
   this PR implements — that the demoted `/v1/onboard/claim` cannot
   establish ownership on an *unclaimed* box. It does NOT yet verify the
@@ -621,7 +630,7 @@ stages exactly, including the `-u root:root` fix from PR #2 for the
 
 ## Test coverage
 
-`cargo test` — 79 tests, all passing as of this writing:
+`cargo test` — 80 tests, all passing as of this writing:
 
 - `qr_payload`: the exact hub grammar (real-shaped payload, `wss://`
   production-style, param-order independence, extra-field tolerance) and
@@ -710,7 +719,42 @@ stages exactly, including the `-u root:root` fix from PR #2 for the
   contains the header, the grouped code, the word "Courier", and at least
   one real QR glyph (proving the QR is genuinely embedded, not silently
   skipped); the composer is a pure function (same input twice → identical
-  output); and different codes produce different screens.
+  output); different codes produce different screens; and (new, tty1
+  visibility) `display_claim_code` genuinely writes the screen to whatever
+  path `BENIX_CLAIM_TTY` resolves to (checked against a real stand-in file,
+  not just that it doesn't panic) and falls back to `println!` without
+  panicking when that path can't be opened for writing.
+
+### This pass's own verification (tty1 visibility, `BENIX_CLAIM_TTY` +
+`BENIX_CLAIM_SCREEN_DELAY_MS`)
+
+Same discipline, same environment (`rust:1.90-trixie` container via local
+Docker, `--platform linux/amd64` on Apple Silicon, matching the
+Jenkinsfile's `Build & Test`/`musl cross-compile` stages exactly, including
+the `-u root:root` fix from PR #2 for the `apt-get` stage):
+
+- `cargo fmt --check` — clean (one formatting fix applied after the first
+  run).
+- `cargo clippy --all-targets -- -D warnings` — clean, zero warnings.
+- `cargo test` — **80/80 passing** (up from 79; one new test, combining the
+  success and fallback cases in a single function deliberately — see that
+  test's own doc comment for why two separate tests touching the same
+  process-global env var would race under `cargo test`'s default parallel
+  execution). Zero regressions in the existing 79.
+- `cargo build --release` — clean.
+- **`cargo build --release --target x86_64-unknown-linux-musl` — succeeded
+  this time**, reproducing the Jenkinsfile's exact recipe (`rust:1.90-trixie`
+  + `apt-get install musl-tools` + `rustup target add` + `cargo build`,
+  `-u root:root`) rather than a bare local `musl-gcc` — the §9rr pass's own
+  `ring`/`-m64` failure was a floating-Docker-tag toolchain issue in that
+  session's specific pull, not a standing property of this crate or this
+  recipe; this pull of the same tag builds `ring` clean. `file(1)` confirms
+  `ELF 64-bit LSB pie executable, ..., static-pie linked, ..., stripped` —
+  the same positive classification (not `ldd`) v0.1.0's own release and
+  every prior musl stage in this repo's history already treat as proof.
+- GitHub Actions / Jenkins: not re-checked this pass — no code-path reason
+  to expect either surface's pre-existing, already-disclosed red state (see
+  the §9hh/§9ii and §9rr sections above) to have changed.
 
 ## Build & CI
 
