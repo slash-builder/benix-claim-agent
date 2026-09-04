@@ -40,14 +40,17 @@ mod config;
 mod error;
 mod handlers;
 mod local_account_binding;
+mod local_claim;
 mod net;
 mod pairing;
 mod qr_payload;
 mod ratelimit;
+mod render;
+mod secret;
 mod state;
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::extract::{ConnectInfo, Request};
 use axum::middleware::{self, Next};
@@ -59,6 +62,7 @@ use tracing_subscriber::EnvFilter;
 
 use config::Config;
 use error::AppError;
+use local_claim::PendingChallengeStore;
 use pairing::{FabricKitPairClaimer, PairClaimer};
 use ratelimit::RateLimiter;
 
@@ -79,6 +83,22 @@ pub struct AppState {
     pub state_dir: std::path::PathBuf,
     pub rate_limiter: RateLimiter,
     pub pair_claimer: Box<dyn PairClaimer>,
+    /// The local-only claim protocol's (§9hh) 128-bit secret, loaded once
+    /// at startup exactly like `keypair` above — never re-read from disk
+    /// per-request. Remains valid in memory even after
+    /// `state::delete_claim_secret` removes the on-disk copy on a
+    /// successful claim; harmless, since `state::is_claimed` gates every
+    /// future request before this value could ever be used again.
+    pub secret: [u8; 16],
+    /// The local-claim protocol's bounded, in-memory pending-challenge map
+    /// (`src/local_claim.rs`).
+    pub pending_challenges: PendingChallengeStore,
+    /// §9ii R2, binding: serializes the "is this box already claimed?"
+    /// re-check against the actual claim-commit write in
+    /// `local_claim::local_claim_finish`, so two concurrent valid finishes
+    /// resolve first-writer-wins rather than racing on a plain
+    /// check-then-write.
+    pub claim_commit_lock: Mutex<()>,
 }
 
 fn init_tracing() {
@@ -111,6 +131,14 @@ async fn require_lan_source(
 pub fn build_router(state: Arc<AppState>) -> Router {
     let claim_routes = Router::new()
         .route("/v1/onboard/claim", post(handlers::onboard_claim))
+        .route(
+            "/v1/onboard/local-claim/challenge",
+            post(local_claim::local_claim_challenge),
+        )
+        .route(
+            "/v1/onboard/local-claim/finish",
+            post(local_claim::local_claim_finish),
+        )
         .route_layer(middleware::from_fn(require_lan_source));
 
     Router::new()
@@ -144,6 +172,25 @@ async fn main() {
         .unwrap_or_else(|| "benixos".to_string());
 
     let already_claimed = state::is_claimed(&config.state_dir);
+
+    // The local-only claim protocol's secret (§9hh) is loaded-or-created
+    // unconditionally at startup — same generate-once-then-reload-forever
+    // posture as `keypair` above — even on an already-claimed box, so a
+    // leftover (already-inert, since `is_claimed()` gates everything ahead
+    // of it) secret file doesn't turn into a startup failure. Only an
+    // UNCLAIMED box actually displays it (see below).
+    let secret = match secret::load_or_create_secret(&config.state_dir) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                state_dir = %config.state_dir.display(),
+                "failed to load/create the local-claim secret, refusing to start"
+            );
+            std::process::exit(1);
+        }
+    };
+
     tracing::info!(
         port = config.port,
         state_dir = %config.state_dir.display(),
@@ -153,6 +200,13 @@ async fn main() {
         "starting benix-claim-agent"
     );
 
+    // §9gg/§9hh: a factory-fresh, unclaimed box shows its secret on
+    // startup — the `render` seam (see `src/render.rs`), not the final
+    // display renderer. A claimed box has nothing left to display.
+    if !already_claimed {
+        render::display_claim_code(&secret::encode_display(&secret));
+    }
+
     let app_state = Arc::new(AppState {
         keypair,
         device_name: config.device_name.clone(),
@@ -160,6 +214,9 @@ async fn main() {
         state_dir: config.state_dir.clone(),
         rate_limiter: RateLimiter::new(config.rate_limit_per_min),
         pair_claimer: Box::new(FabricKitPairClaimer),
+        secret,
+        pending_challenges: PendingChallengeStore::new(),
+        claim_commit_lock: Mutex::new(()),
     });
 
     let router = build_router(app_state);

@@ -42,15 +42,32 @@ pub enum AppError {
     /// 500 — anything this handler cannot attribute to caller input or the
     /// hub (e.g. a state-directory I/O failure). Kept generic and
     /// non-leaky in the response body; the real detail goes to the log.
-    /// Not currently constructed anywhere: the request-handling path's
-    /// only fallible I/O (`state::is_claimed`) degrades to "not claimed"
-    /// rather than erroring, and every other failure mode already has its
-    /// own variant. Kept as a documented, reserved catch-all — the
-    /// finalized contract's error-body table names `5xx` as a real
-    /// possibility for "all 4xx/5xx" — rather than removed and re-added
-    /// the first time something actually needs it.
-    #[allow(dead_code)]
+    /// Now real and constructed: `src/local_claim.rs`'s `finish` handler
+    /// returns this if a post-verification disk write (mark-claimed,
+    /// delete-secret, persist-binding) fails.
     Internal(String),
+    /// 410 — the local-claim protocol's `challenge_id` is unknown or has
+    /// expired (§9hh Item 2's ~120s TTL, enforced on a monotonic clock per
+    /// §9ii R3 — never wall-clock). The caller must restart the handshake
+    /// from `POST /v1/onboard/local-claim/challenge`.
+    ChallengeNotFound,
+    /// 401 — the local-claim protocol's `client_proof` did not match this
+    /// box's own recomputed HMAC, or `client_sig` did not verify against
+    /// `client_pubkey`. Deliberately does NOT consume the box's persisted
+    /// secret or invalidate the pending challenge (§9hh: "a legit typo
+    /// must not burn onboarding" — the 128-bit secret makes online
+    /// guessing infeasible regardless of retry budget, which the rate
+    /// limiter already bounds; §9ii's ratified judgment call: no hard
+    /// lockout, visibility via logging instead).
+    InvalidProof,
+    /// 403 — `POST /v1/onboard/claim` (the hub-mediated path, demoted by
+    /// §9gg to the deferred Hearth-join step, §9hh Item 5) may only run on
+    /// a box that has already completed the local-only claim protocol.
+    /// §9ii R4, binding: this box has no local owner to authorize a hub
+    /// join on behalf of until a local claim exists, and this must be a
+    /// by-construction gate — not merely an accident of the hub being
+    /// unreachable on an offline first boot.
+    NotLocallyClaimed,
 }
 
 impl AppError {
@@ -62,6 +79,9 @@ impl AppError {
             Self::InvalidQrPayload(_) | Self::MalformedRequest(_) => StatusCode::BAD_REQUEST,
             Self::HubUnreachable(_) => StatusCode::BAD_GATEWAY,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::ChallengeNotFound => StatusCode::GONE,
+            Self::InvalidProof => StatusCode::UNAUTHORIZED,
+            Self::NotLocallyClaimed => StatusCode::FORBIDDEN,
         }
     }
 
@@ -74,6 +94,9 @@ impl AppError {
             Self::MalformedRequest(_) => "malformed_request",
             Self::HubUnreachable(_) => "hub_unreachable",
             Self::Internal(_) => "internal_error",
+            Self::ChallengeNotFound => "challenge_not_found",
+            Self::InvalidProof => "invalid_proof",
+            Self::NotLocallyClaimed => "not_locally_claimed",
         }
     }
 
@@ -86,6 +109,16 @@ impl AppError {
             | Self::MalformedRequest(m)
             | Self::HubUnreachable(m)
             | Self::Internal(m) => m.clone(),
+            Self::ChallengeNotFound => {
+                "challenge_id is unknown or has expired; restart the local-claim handshake"
+                    .to_string()
+            }
+            Self::InvalidProof => "client_proof or client_sig did not verify".to_string(),
+            Self::NotLocallyClaimed => {
+                "this box must complete the local-only claim protocol before joining a \
+                 hub-mediated account"
+                    .to_string()
+            }
         }
     }
 }
