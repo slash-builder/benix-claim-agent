@@ -79,11 +79,24 @@ pub struct LocalAccountBinding {
     pub status: BindingStatus,
     pub created_at_ms: i64,
     pub revoked_at_ms: Option<i64>,
+    /// The local-only claim protocol's owner credential
+    /// (`context/projects/benixos.md` §9hh): the Ed25519 public key
+    /// Courier proved possession-adjacent trust for during
+    /// `POST /v1/onboard/local-claim/finish`, base64-encoded. `None` for a
+    /// hub-mediated binding ([`new_active`](Self::new_active)) — that
+    /// path's owner is the hub `account_id`/`principal_id` pair instead,
+    /// not a bare public key. Routed to data-architect, same as every
+    /// other field in this stand-in — not this crate's schema to
+    /// finalize.
+    #[serde(default)]
+    pub owner_pubkey: Option<String>,
 }
 
 impl LocalAccountBinding {
-    /// Build the binding this agent creates on `PairOutcome::Approved` —
-    /// always fresh, always `Active`, never revoked at construction.
+    /// Build the binding this agent creates on `PairOutcome::Approved` (the
+    /// **hub-mediated** path, §9j) — always fresh, always `Active`, never
+    /// revoked at construction. See [`new_active_local`](Self::new_active_local)
+    /// for the local-only claim protocol's (§9hh) counterpart.
     pub fn new_active(
         host_id: String,
         principal_id: String,
@@ -100,6 +113,35 @@ impl LocalAccountBinding {
             status: BindingStatus::Active,
             created_at_ms,
             revoked_at_ms: None,
+            owner_pubkey: None,
+        }
+    }
+
+    /// Build the binding the local-only claim protocol (§9hh) creates on a
+    /// successful `POST /v1/onboard/local-claim/finish` — the local
+    /// counterpart to [`new_active`](Self::new_active). There is no
+    /// hub-assigned `principal_id` to project in this path (no hub is
+    /// involved at all): `principal_id` is set to `owner_pubkey` itself,
+    /// since the owner's public key *is* the principal this claim
+    /// establishes (matching the studio's Ed25519-everywhere principal
+    /// model — a fabric `device_id` is itself a public key).
+    pub fn new_active_local(
+        host_id: String,
+        owner_pubkey: String,
+        local_username: String,
+        created_at_ms: i64,
+    ) -> Self {
+        Self {
+            schema_version: SCHEMA_VERSION,
+            host_id,
+            principal_id: owner_pubkey.clone(),
+            local_uid: None,
+            local_username,
+            account_class: AccountClass::Interactive,
+            status: BindingStatus::Active,
+            created_at_ms,
+            revoked_at_ms: None,
+            owner_pubkey: Some(owner_pubkey),
         }
     }
 }
@@ -123,5 +165,25 @@ mod tests {
         assert_eq!(back.status, BindingStatus::Active);
         assert!(back.revoked_at_ms.is_none());
         assert!(back.local_uid.is_none());
+        assert!(back.owner_pubkey.is_none());
+    }
+
+    #[test]
+    fn new_active_local_binding_records_owner_pubkey_as_the_principal() {
+        let binding = LocalAccountBinding::new_active_local(
+            "venus".to_string(),
+            "QW5FeGFtcGxlUHVia2V5Qnl0ZXM=".to_string(),
+            "benix-box".to_string(),
+            1_700_000_000_000,
+        );
+        let json = serde_json::to_string(&binding).expect("serialize");
+        let back: LocalAccountBinding = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.host_id, "venus");
+        assert_eq!(
+            back.owner_pubkey.as_deref(),
+            Some("QW5FeGFtcGxlUHVia2V5Qnl0ZXM=")
+        );
+        assert_eq!(back.principal_id, "QW5FeGFtcGxlUHVia2V5Qnl0ZXM=");
+        assert_eq!(back.status, BindingStatus::Active);
     }
 }

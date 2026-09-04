@@ -95,6 +95,43 @@ hex = "0.4"
 # fabric-kit's own dependency tree.
 async-trait = "0.1"
 
+# --- Local-only claim protocol (context/projects/benixos.md §9hh/§9ii) ---
+# None of the four crates below are *new* to this crate's resolved
+# dependency tree — every one is already present transitively (via
+# fabric-kit/ed25519-dalek/message-kit's own WebSocket stack) at the exact
+# versions pinned below, confirmed against Cargo.lock before adding any of
+# them. Cargo requires a *direct* dependency entry to `use` a crate at all,
+# even one already resolved transitively — so this section promotes four
+# already-resolved, already-musl-proven crates to direct deps rather than
+# introducing new musl-risk surface.
+#
+# 128 bits of CSPRNG entropy for the local-claim secret (src/secret.rs) —
+# the exact same `OsRng` source `fabric_kit::DeviceKeypair::generate` already
+# uses internally (`rand::rngs::OsRng` feeding `ed25519_dalek::SigningKey::
+# generate`). Locked at 0.8.8 already; pinned here to match.
+rand = "0.8"
+# HMAC-SHA256 for the mutual proof-of-possession handshake
+# (src/local_claim.rs): `client_proof`/`box_proof` computation, and —
+# load-bearing, not incidental (§9ii R1) — `Mac::verify_slice`'s
+# constant-time comparison for checking a submitted `client_proof`. Already
+# resolved transitively (RustCrypto's own dependency chain); pinned here to
+# match the locked versions.
+hmac = "0.12"
+sha2 = "0.10"
+# Ed25519 signature verification for `client_sig` (src/local_claim.rs) —
+# `VerifyingKey`/`Signature`/`Verifier`, the read side of the exact
+# primitive `fabric_kit::DeviceKeypair` already wraps for signing. Same
+# crate, same locked version (2.2.0) `fabric-kit` itself depends on.
+ed25519-dalek = "2"
+# Base64 for the local-claim wire contract's JSON fields (`client_pubkey`,
+# `server_nonce`, `box_pubkey`, `client_proof`, `client_sig`, `box_proof`).
+# `data-encoding` rather than the crate literally named `base64`: already
+# resolved transitively (`tokio-tungstenite`'s own WebSocket handshake
+# depends on it for its `Sec-WebSocket-Key` header), so this is the
+# zero-new-crate choice — genuinely new to `fabric-kit`'s tree would be
+# adding `base64` itself, not reusing what's already there.
+data-encoding = "2"
+
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 tower = { version = "0.4", features = ["util"] }

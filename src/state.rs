@@ -8,8 +8,10 @@
 //! path, different filenames underneath it.
 
 use std::fs;
+use std::fs::OpenOptions;
 use std::io;
-use std::os::unix::fs::PermissionsExt;
+use std::io::Write as _;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 #[cfg(test)]
 use std::path::PathBuf;
@@ -24,19 +26,67 @@ const CLAIMED_FILENAME: &str = "claimed";
 const PAIR_CREDENTIALS_FILENAME: &str = "pair-credentials";
 const LOCAL_ACCOUNT_BINDING_FILENAME: &str = "local-account-binding";
 
-/// Write `contents` to `path` via write-then-rename (same crash-safety
-/// idiom as `benix-mdns-advertiser`'s `id.rs`), then restrict permissions
-/// to owner-read-write-only — every file this module writes carries either
-/// key material or claim-adjacent metadata that has no business being
-/// world-readable.
-fn write_private_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
-    }
+/// Write `contents` to `path` via write-then-rename, hardened per
+/// `context/projects/benixos.md` §9ii R5 (the QR-117 write-before-chmod
+/// race class, made explicit and binding for `secret.rs`'s new
+/// `claim-secret` file, and fixed here for every existing caller too since
+/// they all share this one helper):
+///
+/// 1. The temp file is created **mode 0600 from the `open` call itself**
+///    (`O_CREAT`, explicit `mode(0o600)`) — never
+///    create-with-default-mode-then-`chmod`, which leaves a real (if
+///    narrow) window where the file exists at a world/group-readable mode
+///    before the follow-up `chmod` lands.
+/// 2. The temp file lives in the **same directory** as the final path (via
+///    [`Path::with_extension`], unchanged from before this hardening pass)
+///    so the final [`fs::rename`] is a same-filesystem, atomic rename.
+/// 3. The temp file's contents are `fsync`'d (`File::sync_all`) **before**
+///    the rename, and the **parent directory** is `fsync`'d **after** —
+///    without this, a crash mid-write (or right after an unsynced rename)
+///    can leave the target either empty/partial or pointing at a stale
+///    directory entry. For `secret.rs`'s caller specifically this is a
+///    *correctness* requirement, not just hygiene: an unsynced crash could
+///    make the box regenerate a **different** secret on the next boot,
+///    silently breaking §9gg's "the same code the user is staring at
+///    survives a restart" guarantee.
+///
+/// `pub(crate)` (not `pub`, not private): `src/secret.rs` reuses this exact
+/// idiom for the local-claim secret rather than reimplementing it (§9hh's
+/// own explicit instruction) — this module is still the one place that
+/// owns "how a private state file gets written," `secret.rs` just also
+/// needs to call it.
+pub(crate) fn write_private_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
+    let dir = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "write_private_atomic: path has no parent directory",
+        )
+    })?;
+    fs::create_dir_all(dir)?;
+    // §9ii R5(4): the state directory itself is not world/group-traversable
+    // — every file under it carries key material or claim-adjacent
+    // metadata. (Ownership, i.e. "root-owned," is a deployment/dinit-unit
+    // concern — which user this process runs as — not something this
+    // in-process call can or should force via `chown`; see README's "Open,
+    // routed rather than decided here.")
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+
     let tmp_path = path.with_extension("tmp");
-    fs::write(&tmp_path, contents)?;
-    fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600))?;
+    let mut tmp_file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp_path)?;
+    tmp_file.write_all(contents)?;
+    tmp_file.sync_all()?;
+    drop(tmp_file);
+
     fs::rename(&tmp_path, path)?;
+
+    let dir_handle = fs::File::open(dir)?;
+    dir_handle.sync_all()?;
+
     Ok(())
 }
 
@@ -72,13 +122,28 @@ pub fn is_claimed(state_dir: &Path) -> bool {
 #[derive(Serialize, Deserialize)]
 struct ClaimedMarker {
     claimed_at_ms: i64,
-    device_id: String,
-    account_id: String,
+    /// Hub-assigned identifiers from the hub-mediated claim (`mark_claimed`
+    /// / `src/handlers.rs`). `None` for a local claim, which has no hub
+    /// identity to record.
+    #[serde(default)]
+    device_id: Option<String>,
+    #[serde(default)]
+    account_id: Option<String>,
+    /// The local-only claim protocol's owner credential (§9hh): the
+    /// requester's Ed25519 public key, base64-encoded. `None` for a
+    /// hub-mediated claim (`mark_claimed`), whose owner is the hub
+    /// `device_id`/`account_id` pair instead. Set only by
+    /// `mark_claimed_local`.
+    #[serde(default)]
+    owner_pubkey: Option<String>,
 }
 
-/// Flip local state to claimed. Called from exactly one place: the
-/// background task's handling of `PairOutcome::Approved`, never from the
-/// request-handling path itself (see `src/handlers.rs`).
+/// Flip local state to claimed via the **hub-mediated** path (§9j). Called
+/// from exactly one place: the background task's handling of
+/// `PairOutcome::Approved`, never from the request-handling path itself
+/// (see `src/handlers.rs`). See [`mark_claimed_local`] for the local-only
+/// claim protocol's (§9hh) counterpart — distinct because a local claim has
+/// no hub-assigned `device_id`/`account_id` to record.
 pub fn mark_claimed(
     state_dir: &Path,
     device_id: &str,
@@ -87,11 +152,46 @@ pub fn mark_claimed(
 ) -> io::Result<()> {
     let marker = ClaimedMarker {
         claimed_at_ms: at_ms,
-        device_id: device_id.to_string(),
-        account_id: account_id.to_string(),
+        device_id: Some(device_id.to_string()),
+        account_id: Some(account_id.to_string()),
+        owner_pubkey: None,
     };
     let json = serde_json::to_vec_pretty(&marker)?;
     write_private_atomic(&state_dir.join(CLAIMED_FILENAME), &json)
+}
+
+/// Flip local state to claimed via the **local-only** claim protocol
+/// (§9hh): `owner_pubkey` (base64 Ed25519 public key) is recorded in place
+/// of a hub `device_id`/`account_id` pair. Called from exactly one place:
+/// `src/local_claim.rs`'s `finish` handler, on a verified mutual-HMAC
+/// handshake — never speculatively, and never before `client_sig` has been
+/// checked. Same on-disk marker file as [`mark_claimed`]; `is_claimed`
+/// doesn't care which of the two wrote it.
+pub fn mark_claimed_local(state_dir: &Path, owner_pubkey: &str, at_ms: i64) -> io::Result<()> {
+    let marker = ClaimedMarker {
+        claimed_at_ms: at_ms,
+        device_id: None,
+        account_id: None,
+        owner_pubkey: Some(owner_pubkey.to_string()),
+    };
+    let json = serde_json::to_vec_pretty(&marker)?;
+    write_private_atomic(&state_dir.join(CLAIMED_FILENAME), &json)
+}
+
+/// Delete `<state_dir>/claim-secret`. Called from exactly two places: the
+/// local-claim `finish` handler's consume-on-success step (§9hh — the
+/// secret is single-use), and (in a later pass, not this one — see §9hh
+/// Item 1) a factory-reset/unclaim path, which must wipe this file
+/// alongside `<state_dir>/mdns-id` per the same ownership-boundary rotation
+/// contract §9w binds on the mDNS `id`. Idempotent: a missing file is not
+/// an error (the caller may race a retry, or this may run on a box that
+/// was never actually unclaimed-with-a-secret in the first place).
+pub fn delete_claim_secret(state_dir: &Path) -> io::Result<()> {
+    match fs::remove_file(state_dir.join(crate::secret::CLAIM_SECRET_FILENAME)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 /// On-disk shape for `PairCredentials`. Not `fabric_kit::PairCredentials`

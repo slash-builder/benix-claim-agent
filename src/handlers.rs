@@ -74,13 +74,34 @@ pub async fn onboard_claim(
         return Err(AppError::RateLimited);
     }
 
-    // --- Step 2: fail-closed guard. ---
-    if state::is_claimed(&state.state_dir) {
+    // --- Step 2 (redefined by §9gg/§9hh, made a binding gate by §9ii R4):
+    // this endpoint is no longer BenixOS's initial-ownership path — DJ's
+    // ruling (§9gg) moved that to the local-only claim protocol
+    // (`src/local_claim.rs`). This endpoint is *demoted but not deleted*:
+    // it is now the deferred Hearth-join step (§9hh Item 5), reachable
+    // only once a box has already completed a LOCAL claim. An unclaimed
+    // box has no local `owner_pubkey` to authorize a hub join on behalf
+    // of, so this must fail closed by construction — not merely because
+    // the hub happens to be unreachable on an offline first boot (§9ii's
+    // own finding: "should, because it can't reach the hub" is not a
+    // gate). See `handlers::tests::unclaimed_box_returns_403_and_never_
+    // reaches_pair_claim` for the real regression test §9ii R4 requires.
+    //
+    // **Known gap, named not built (§9hh Item 5 / §9ii R4's own
+    // deferral):** this only checks that *a* local claim happened; it does
+    // NOT verify the caller is authenticated as the recorded owner via a
+    // signature challenge. That "owner-signature auth" mechanism does not
+    // exist in this crate yet and is explicitly out of scope for this pass
+    // (a messaging-architect + data-architect + software-developer item,
+    // per §9hh Item 5's own text) — flagged in README.md, not silently
+    // left implicit.
+    if !state::is_claimed(&state.state_dir) {
         tracing::warn!(
             source_ip = %addr.ip(),
-            "claim POST received on an already-claimed box — anomaly, not a re-claim flow"
+            "hub-mediated claim POST received on a box that has not completed the \
+             local-only claim protocol — refusing by construction (§9ii R4)"
         );
-        return Err(AppError::AlreadyClaimed);
+        return Err(AppError::NotLocallyClaimed);
     }
 
     // --- Content-Type + body parsing (ahead of the qr_payload grammar
@@ -252,10 +273,25 @@ mod tests {
             keypair: DeviceKeypair::generate(),
             device_name: "test-box".to_string(),
             host_id: "test-host".to_string(),
+            secret: crate::secret::load_or_create_secret(&dir).expect("test secret"),
+            pending_challenges: crate::local_claim::PendingChallengeStore::new(),
+            claim_commit_lock: std::sync::Mutex::new(()),
             state_dir: dir,
             rate_limiter: RateLimiter::new(10),
             pair_claimer: Box::new(pair_claimer),
         })
+    }
+
+    /// Every test below that exercises `onboard_claim` past its §9ii R4
+    /// gate needs the box to already be locally claimed (that gate is the
+    /// whole point of this PR — see `handlers::onboard_claim`'s own doc
+    /// comment). This helper marks a box as locally claimed the same way
+    /// `local_claim::local_claim_finish` would, without going through the
+    /// full HTTP handshake (that handshake has its own dedicated test
+    /// suite in `local_claim.rs`).
+    fn mark_locally_claimed_for_test(dir: &std::path::Path) {
+        state::mark_claimed_local(dir, "test-owner-pubkey-base64", now_ms())
+            .expect("mark_claimed_local for test setup");
     }
 
     fn credentials() -> PairCredentials {
@@ -414,10 +450,24 @@ mod tests {
         assert!(!is_lan_source(wan_addr().ip()));
     }
 
+    /// **§9ii R4's own required regression test**, verbatim per its text:
+    /// "assert and test that the demoted endpoint cannot record local
+    /// ownership on an unclaimed box... prove it with a test that hits the
+    /// old endpoint on an unclaimed, offline box." This box is genuinely
+    /// unclaimed (no local claim, no hub credentials) and the mock
+    /// `PairClaimer` would happily hand back an `Approved` outcome if ever
+    /// invoked — the assertion that matters is that `pair_claim` is never
+    /// even reached, proven the same way `already_claimed_returns_409...`
+    /// used to prove its own analogous claim: the mock has no assertion
+    /// wired against being called a *second* time here, but the response
+    /// itself proves the handler returned before Step 5 (see
+    /// `onboard_claim`'s own doc comment) — a `403` before any `202`/`502`
+    /// could ever be produced.
     #[tokio::test]
-    async fn already_claimed_returns_409_and_never_reaches_pair_claim() {
+    async fn unclaimed_box_returns_403_and_never_reaches_pair_claim() {
         let dir = temp_state_dir();
-        state::mark_claimed(&dir, "device-x", "account-x", now_ms()).unwrap();
+        // Deliberately NOT locally claimed, NOT hub-joined — the exact
+        // "genuinely offline, first-boot box" scenario §9ii names.
         let state = test_state(
             dir.clone(),
             MockPairClaimer::claim_ok_then(ack(), Ok(PairOutcome::Approved(credentials()))),
@@ -433,7 +483,11 @@ mod tests {
             ))
             .unwrap();
         let response = oneshot_with_addr(router, request, lan_addr()).await;
-        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(
+            !state::pair_credentials_path(&dir).exists(),
+            "an unclaimed box must not be able to record hub-join credentials, by construction"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -462,6 +516,7 @@ mod tests {
     #[tokio::test]
     async fn invalid_qr_payload_returns_400() {
         let dir = temp_state_dir();
+        mark_locally_claimed_for_test(&dir);
         let state = test_state(
             dir.clone(),
             MockPairClaimer::claim_ok_then(ack(), Ok(PairOutcome::Approved(credentials()))),
@@ -483,6 +538,7 @@ mod tests {
     #[tokio::test]
     async fn successful_claim_returns_202_immediately() {
         let dir = temp_state_dir();
+        mark_locally_claimed_for_test(&dir);
         let state = test_state(
             dir.clone(),
             MockPairClaimer::claim_ok_then(ack(), Ok(PairOutcome::Approved(credentials()))),
@@ -505,6 +561,7 @@ mod tests {
     #[tokio::test]
     async fn hub_unreachable_returns_502_and_does_not_claim() {
         let dir = temp_state_dir();
+        mark_locally_claimed_for_test(&dir);
         let state = test_state(
             dir.clone(),
             MockPairClaimer::claim_err(FabricError::Transport("refused".to_string())),
@@ -521,13 +578,19 @@ mod tests {
             .unwrap();
         let response = oneshot_with_addr(router, request, lan_addr()).await;
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-        assert!(!state::is_claimed(&dir));
+        // The box was already (locally) claimed before this request, per
+        // the new §9ii R4 precondition — `is_claimed()` stays `true`
+        // throughout regardless of the hub outcome. The meaningful
+        // postcondition here is that the hub-join itself did not succeed:
+        // no `pair-credentials` were ever persisted.
+        assert!(!state::pair_credentials_path(&dir).exists());
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
     async fn missing_content_type_returns_400() {
         let dir = temp_state_dir();
+        mark_locally_claimed_for_test(&dir);
         let state = test_state(
             dir.clone(),
             MockPairClaimer::claim_ok_then(ack(), Ok(PairOutcome::Approved(credentials()))),
@@ -549,6 +612,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_field_in_body_is_rejected() {
         let dir = temp_state_dir();
+        mark_locally_claimed_for_test(&dir);
         let state = test_state(
             dir.clone(),
             MockPairClaimer::claim_ok_then(ack(), Ok(PairOutcome::Approved(credentials()))),

@@ -1,15 +1,27 @@
 # benix-claim-agent
 
-BenixOS's box-side claim agent: the identity/state-machine core (an
-Ed25519 `DeviceKeypair`, persisted to disk; a persisted `claimed`/
-`unclaimed` flag) plus the LAN onboarding endpoint
-(`POST /v1/onboard/claim`) Courier delivers a hub-issued `qr_payload` to.
-This is the box-side half of QR-37 Story 3 (Courier delivering a
-hub-issued `qr_payload` to a headless BenixOS box over the LAN, instead of
-rendering it as a QR code for camera scan — a headless box has no screen)
-and the first real code toward Task #23, per the finalized contract in
-`context/projects/benixos.md` §9j (`dlockamy/vault` workspace),
-dispatched by `benixos-pm` 2026-09-02.
+BenixOS's box-side claim agent. Two claim paths now live here:
+
+- **The local-only claim protocol** (`POST /v1/onboard/local-claim/{challenge,finish}`,
+  `src/local_claim.rs`) — the box's **default and only path for initial
+  ownership**, per DJ's ruling (`context/projects/benixos.md` §9gg) that
+  onboarding must work fully local, zero hub/cloud dependency. A 128-bit
+  secret the box generates and displays itself (`src/secret.rs`), proven
+  via a mutual-HMAC handshake and **never transmitted**; the owner
+  credential recorded is Courier's Ed25519 public key, not a bearer token.
+  Designed by messaging-architect (§9hh) and ratified with binding required
+  changes by security-engineer's adversarial review (§9ii) — see "Local-only
+  claim protocol" below.
+- **The hub-mediated path** (`POST /v1/onboard/claim`, `src/handlers.rs`) —
+  the identity/state-machine core this repo originally shipped (an Ed25519
+  `DeviceKeypair`; Courier delivers a hub-issued `qr_payload`). §9gg/§9hh
+  **demote** this to the deferred Hearth-join step (join an existing hub
+  account *after* a local claim already exists) — it is retained, not
+  deleted, but **can no longer establish initial ownership on an unclaimed
+  box** (§9ii R4, enforced — see below). Originally the first real code
+  toward Task #23, per the finalized contract in
+  `context/projects/benixos.md` §9j, dispatched by `benixos-pm`
+  2026-09-02.
 
 ## Why this exists, and why here
 
@@ -90,7 +102,122 @@ best-effort partial parse. `pair_session_id` is treated as an opaque
 non-empty string, not validated as a UUID beyond that — the hub is the
 source of truth for its shape.
 
-### The route
+## Local-only claim protocol (default path for initial ownership)
+
+Full design: `context/projects/benixos.md` §9hh (messaging-architect's
+protocol/wire-contract) and §9ii (security-engineer's binding adversarial
+review — **VERDICT: RATIFIED WITH NAMED REQUIRED CHANGES**, R1-R5, all
+folded into this implementation, not left as follow-up).
+
+**The one load-bearing property**: the secret is *proven*, never
+*transmitted*, and the owner credential is a *public key*, not a bearer
+token — so there is no value on the wire, in either direction, whose
+observation grants takeover. This is what makes the plain-HTTP (no TLS)
+call defensible on its own merits (§9ii affirmed this, with one binding
+invariant — see "Transport & bind" below).
+
+### The secret (`src/secret.rs`)
+
+128 bits of CSPRNG entropy (`rand::rngs::OsRng`, the exact source
+`fabric_kit::DeviceKeypair::generate` already uses), generated once on
+first boot of an unclaimed box and persisted to `<state_dir>/claim-secret`
+(mode `0600`, hardened write-then-rename — see §9ii R5 below). **Not
+regenerated on restart** while unclaimed, and **no wall-clock expiry** —
+both deliberate (§9hh Item 1, reaffirmed by §9ii: an offline first-boot box
+has no trustworthy clock, so a wall-clock expiry could not even be
+implemented honestly on the target hardware). Displayed as unpadded
+Crockford Base32, grouped `XXXXX-XXXXX-XXXXX-XXXXX-XXXXXX` (26 chars) —
+case-insensitive, `I`/`L`/`O` collision-free by construction, and tolerant
+of `O`→`0`/`I`,`L`→`1` substitution on decode (Crockford's own documented
+leniency). On startup, an **unclaimed** box prints this code to stdout
+(`src/render.rs`'s `display_claim_code` — a `render` seam, not the final
+display renderer; dinit already routes stdout to console/serial today, per
+§9h — a production unit's physical LCD or a QR/framebuffer path is later,
+separate work that only needs to implement this same seam differently).
+
+### The wire contract (`src/local_claim.rs`)
+
+**Step 1 — `POST /v1/onboard/local-claim/challenge`**
+Request: `{"client_pubkey": "<base64, 32-byte Ed25519>"}` (Courier's own
+keypair — its public half is the identity being bound as owner).
+Response: `{"challenge_id", "server_nonce": "<base64, 16 bytes>",
+"box_pubkey": "<base64, 32 bytes>", "expires_at_ms"}`.
+
+**Step 2 — `POST /v1/onboard/local-claim/finish`**
+Courier computes (raw decoded bytes, fixed order/length — never base64
+text):
+```
+transcript   = server_nonce ‖ client_pubkey ‖ box_pubkey      (16‖32‖32 bytes)
+client_proof = HMAC-SHA256(key=secret, "benix-claim/client" ‖ transcript)
+client_sig   = Ed25519-sign(client_privkey, challenge_id ‖ client_proof)
+```
+Request: `{"challenge_id", "client_pubkey", "client_proof": "<base64>",
+"client_sig": "<base64>"}`.
+On success, response: `{"status": "claimed", "box_pubkey", "box_id",
+"box_proof": "<base64, HMAC-SHA256(secret, "benix-claim/box" ‖ transcript)>",
+"claimed_at_ms"}`. **Courier MUST verify `box_proof` before trusting the
+claim** — a spoofed/fake box cannot produce it (defeats mDNS-spoof T7).
+
+| Response | When |
+|---|---|
+| `429 rate_limited` | token-bucket budget exhausted for this source IP |
+| `403 non_lan_source` | source IP is not RFC1918/ULA/link-local |
+| `409 already_claimed` | box already (locally) claimed |
+| `410 challenge_not_found` | `challenge_id` unknown or expired (~120s TTL, monotonic clock — §9ii R3) |
+| `401 invalid_proof` | `client_proof` or `client_sig` did not verify — secret and challenge NOT consumed (a typo must not burn onboarding) |
+| `400 malformed_request` | bad JSON / bad base64 / wrong field length |
+| `200` | see the two response shapes above |
+
+### §9ii's binding required changes (R1-R5), as implemented
+
+- **R1 — constant-time compare.** `hmac::Mac::verify_slice` (uses
+  `subtle::ConstantTimeEq` internally, confirmed against that crate's own
+  source before relying on it) — never a plain `==` on decoded bytes, which
+  would open a timing oracle leaking a directly-replayable proof.
+- **R2 — atomic claim commit.** The `claimed?` re-check and the actual
+  commit (mark-claimed, delete-secret, persist-binding,
+  invalidate-challenge) run inside one `AppState::claim_commit_lock`-guarded
+  critical section. Proven with a real concurrency test
+  (`local_claim::tests::concurrent_valid_finishes_resolve_first_writer_wins`)
+  using genuine OS-thread parallelism (`#[tokio::test(flavor =
+  "multi_thread")]` + `tokio::spawn`, not a timing hack): two
+  simultaneously-valid finishes for two different owner keys resolve
+  first-writer-wins, the loser gets `409`, and the persisted `owner_pubkey`
+  always matches the actual winner, never a mix.
+- **R3 — monotonic challenge TTL.** `Instant`-based, never wall-clock;
+  `expires_at_ms`/`claimed_at_ms` in responses are advisory display
+  metadata only.
+- **R4 — the demoted `/v1/onboard/claim` cannot establish initial
+  ownership on an unclaimed box, by construction.** See "Deviations" below
+  — this is a real, tested behavior change to that endpoint, not an
+  accident of hub-unreachability.
+- **R5 — persistence hardening.** `state::write_private_atomic` (reused by
+  `secret.rs`, and now every other caller in `state.rs` too) creates the
+  temp file mode `0600` from the `open` call itself (never
+  create-then-`chmod` — the exact QR-117 race class), `fsync`s the temp
+  file before rename and the parent directory after, and sets the state
+  directory itself to `0700`.
+
+Also folded in: **m1** (`challenge_id` is CSPRNG via `Uuid::new_v4`, never
+sequential), **m2** (the transcript's byte framing is nailed down and
+worked-example'd above), **m3** (the pending-challenge map is
+capacity-bounded at 256 entries, evict-soonest-to-expire when full), **m4**
+(the transcript always uses the *finish* request's `client_pubkey`; the
+step-1 value is never even persisted), **m5** (the LAN gate reads
+`ConnectInfo<SocketAddr>`, the real socket peer address, never a header).
+**Visibility over lockout** (§9ii's ratified judgment call): failed proofs
+are logged (`tracing::warn!` with source IP + `challenge_id`) but do not
+trip any hard lockout — the existing rate limiter already makes online
+guessing infeasible at 128 bits, and a lockout would let an attacker deny
+the legitimate user their own onboarding.
+
+**Known gap, named not built**: `m6` (Courier-side recovery on a
+crash-between-commit-and-response) and `m7` (a future owner-signature-gated
+unclaim/factory-reset endpoint) are both out of scope for this pass —
+`m6` is Courier's own logic in a different repo; `m7` has no unclaim
+endpoint to gate yet.
+
+### `POST /v1/onboard/claim` — the route (demoted, deferred Hearth-join)
 
 `POST /v1/onboard/claim`, body `{"qr_payload": "<string>"}`
 (`Content-Type: application/json` required, no other fields accepted).
@@ -99,7 +226,7 @@ source of truth for its shape.
 |---|---|
 | `429 rate_limited` | token-bucket budget exhausted for this source IP |
 | `403 non_lan_source` | source IP is not RFC1918/ULA/link-local |
-| `409 already_claimed` | box already claimed (anomaly, logged `warn`, no side effects) |
+| `403 not_locally_claimed` | **new (§9ii R4):** box has not completed the local-only claim protocol yet — this endpoint refuses by construction, not because the hub happens to be unreachable |
 | `400 invalid_qr_payload` / `malformed_request` | grammar deviation or bad JSON body |
 | `502 hub_unreachable` | `pair_claim` itself failed; no local state change |
 | `202 claim_initiated` | claim started; `{"status", "pair_session_id", "expires_at_ms"}` |
@@ -136,24 +263,33 @@ This agent creates no real POSIX user account (out of scope), so
 
 ## Transport & bind
 
-Plain HTTP/1.1, no TLS — no cert story exists on a fresh unclaimed box,
-and this hop carries no secret material (the session id is single-use and
-short-lived; the real security boundary is Hearth's own `TPair`/
-fingerprint-approval flow downstream of this, not this LAN hop). Binds
-explicitly to the box's own non-loopback interface address(es) via
-`if-addrs` — **never `0.0.0.0`**. As defense-in-depth, the claim route
-also rejects (403) any inbound request whose source IP is not
-RFC1918/ULA/link-local, even though bind-scoping should already prevent
-WAN reachability by construction.
+Plain HTTP/1.1, no TLS. For the local-only claim protocol this is a real,
+engaged security-engineer call (§9ii), not a default: TLS would buy
+confidentiality (nothing to hide — no wire secret), tamper-integrity (a
+MITM can only DoS, which it can do anyway), and server-authentication —
+and only the last is real value, which `box_proof` + `box_pubkey`
+TOFU-pinning already provide; a from-scratch offline first boot has no
+reachable CA anyway, so TLS would collapse to self-signed TOFU regardless.
+**Binding invariant (§9ii): this call is contingent on the secret-off-wire
+property** — any future change that puts a secret or bearer on the wire
+re-opens the TLS question. For the demoted `/v1/onboard/claim` route, the
+original reasoning stands unchanged: no cert story on a fresh box, and (now)
+that route only runs post-local-claim anyway. Binds explicitly to the
+box's own non-loopback interface address(es) via `if-addrs` — **never
+`0.0.0.0`**. As defense-in-depth, every claim route also rejects (403) any
+inbound request whose source IP is not RFC1918/ULA/link-local (checked
+against the real socket peer address, never a forwarded header — §9ii m5),
+even though bind-scoping should already prevent WAN reachability by
+construction.
 
 ## Configuration (env vars, all optional)
 
 | Var | Default | Meaning |
 |---|---|---|
 | `BENIX_MDNS_PORT` | `8420` | Listen port. **Shared name with `benix-mdns-advertiser`'s own SRV-record port var — deliberately.** Its SRV record and this endpoint's actual listen port must always agree; reusing the identical name is the cheapest way to keep them from silently drifting apart. **Known integration risk** (flagged in the finalized contract): there is no single shared environment source yet for the two binaries — a `meta-benixos` dinit-unit pass needs to land one. Not this repo's job to solve; just don't make it worse. |
-| `BENIX_CLAIM_STATE_DIR` | `/var/lib/benixos` | State directory. Distinct var name from the advertiser's `BENIX_MDNS_STATE_DIR`; same default path is fine — different filenames underneath (`device-key`, `claimed`, `pair-credentials`, `local-account-binding`). |
-| `BENIX_CLAIM_RATE_LIMIT_PER_MIN` | `10` | Per-source-IP token-bucket budget on the claim route. |
-| `BENIX_CLAIM_DEVICE_NAME` | this box's hostname | The `proposed_device_name` sent to the hub at claim time. |
+| `BENIX_CLAIM_STATE_DIR` | `/var/lib/benixos` | State directory (now created `0700`, per §9ii R5). Distinct var name from the advertiser's `BENIX_MDNS_STATE_DIR`; same default path is fine — different filenames underneath (`device-key`, `claimed`, `pair-credentials`, `local-account-binding`, and now `claim-secret` — the local-only claim protocol's secret, wiped on claim). |
+| `BENIX_CLAIM_RATE_LIMIT_PER_MIN` | `10` | Per-source-IP token-bucket budget, shared by every claim route (local-claim and the demoted hub-mediated one alike). |
+| `BENIX_CLAIM_DEVICE_NAME` | this box's hostname | The `proposed_device_name` sent to the hub at claim time (hub-mediated path only). |
 | `RUST_LOG` | `info` | Standard `tracing-subscriber` env filter. |
 
 ## Explicitly out of scope for this pass
@@ -164,9 +300,20 @@ WAN reachability by construction.
   NOT hold the household content key and MUST NOT issue `/keys/request`.
   Its scope is pairing (identity + sealing keys) and `LocalAccountBinding`
   only. Nothing content-key-adjacent lives in this crate.
-- **No fingerprint rendering, no QR rendering, no UI of any kind.**
-  Headless backend service; the human fingerprint-compare step happens
-  entirely on Courier's side against the hub.
+- **No fingerprint rendering, no QR rendering.** The local-claim protocol's
+  `src/render.rs` prints the plain-text code to stdout (a real `render`
+  seam, per §9hh Item 1) — a QR bitmap or physical-LCD renderer for
+  production hardware is separate, later display-layer work that
+  implements the same seam differently, not a protocol change.
+- **No owner-signature authentication mechanism.** §9ii R4 requires — and
+  this PR implements — that the demoted `/v1/onboard/claim` cannot
+  establish ownership on an *unclaimed* box. It does NOT yet verify the
+  caller is authenticated as the box's recorded `owner_pubkey` via a
+  signature challenge once the box *is* claimed — that mechanism doesn't
+  exist in this crate yet and is explicitly deferred (§9hh Item 5: a
+  messaging-architect + data-architect + software-developer item for a
+  later pass, alongside the real conditional-write-ordering work that step
+  needs against the hub's own last-write-wins key registration).
 - **No `meta-benixos` dinit unit or BitBake recipe.** Separate,
   sequenced-after work once this binary and its musl release artifact
   exist, same two-step sequence `qr-gateway` and the mDNS advertiser both
@@ -175,9 +322,10 @@ WAN reachability by construction.
   hub-side gap where pre-Hello `TPair(CLAIM)` isn't rate-limited) — routed
   to different work. This agent's own outbound `TPair(CLAIM)` calls land
   on that under-protected hub-side path today; not addressed here.
-- **No re-claim / factory-reset flow.** Every box this endpoint sees is
-  assumed to be a clean install; an already-claimed box hitting this route
-  is an anomaly (409, logged), not a case to build a flow for.
+- **No unclaim / factory-reset endpoint.** §9hh names the contract it must
+  satisfy when built (wipe `claim-secret` alongside `mdns-id`,
+  owner-signature-gated, fail-closed — §9ii m7) — not built here; there is
+  nothing to unclaim from in this pass's own test matrix.
 - **No real LAN broadcast-and-connect verification.** No live hub, no
   real Courier POST, no on-target dinit run — see "What was actually
   verified" below for the honest line between what ran and what's
@@ -211,6 +359,22 @@ WAN reachability by construction.
   tests the state-transition logic without a live or mock-transport-level
   hub connection, same requirement the contract states — just at a
   narrower seam than wire-frame mocking would be.
+- **`POST /v1/onboard/claim`'s fail-closed gate flips from "already
+  claimed → 409" to "not yet locally claimed → 403" (§9ii R4).** This is a
+  real, tested behavior change to a previously-shipped route, not an
+  addition: on an unclaimed box this endpoint now refuses (403
+  `not_locally_claimed`) before even parsing its body, where it previously
+  proceeded to attempt a hub pairing. Required because §9gg/§9hh moved
+  initial-ownership establishment to the local-only claim protocol, and
+  §9ii found that this route's old "should fail because the hub is
+  unreachable" posture was an accident of connectivity, not a real gate.
+  The six existing tests that exercised this route against a genuinely
+  unclaimed box were updated to first locally-claim the box (matching its
+  new precondition as the deferred Hearth-join step) rather than left
+  passing-but-testing-a-retired-contract; one of them
+  (`already_claimed_returns_409...`) is retired and replaced by
+  `unclaimed_box_returns_403_and_never_reaches_pair_claim` — §9ii R4's own
+  required regression test, verbatim.
 
 ## What was actually verified, and how
 
@@ -302,9 +466,44 @@ What was actually run here, not just claimed:
 - `LocalAccountBinding`'s schema is a stand-in (see above), not a locked
   design.
 
+### This pass's own verification (local-only claim protocol, §9hh/§9ii)
+
+Same discipline as above — real, checked, not claimed on faith. Run inside
+a `rust:1.90-trixie` container (host + registry access, this crate's own
+established verification environment):
+
+- `cargo fmt --check` — clean.
+- `cargo clippy --all-targets -- -D warnings` — clean, zero warnings.
+- `cargo test` — **68/68 passing** (up from 49; 19 new tests: 2 in
+  `secret`'s round-trip/case-insensitivity suite beyond the two the spec
+  asked for, plus a display-shape test; 2 in `local_account_binding`; 1 in
+  `handlers` — the retired-and-replaced R4 regression test; 13 in
+  `local_claim` — see "Test coverage" below).
+- `cargo build --release` — clean.
+- **`cargo build --release --target x86_64-unknown-linux-musl` — attempted,
+  did NOT succeed in this session's container, and this is disclosed
+  rather than hidden or silently worked around.** The failure is `ring`
+  (an existing transitive TLS dependency, not anything this PR adds)
+  failing to compile its C sources: `musl-gcc`'s `cc1` in this pull of
+  `rust:1.90-trixie` rejects `-m64` outright. **Confirmed NOT a regression
+  this PR introduced**: the identical failure reproduces byte-for-byte
+  against the pre-existing baseline commit (`da7a035`, before any change in
+  this PR), checked via `git stash` before concluding anything. This
+  contradicts the musl spike this repo's own README already claims as a
+  clean pass under the same image tag — most likely explained by
+  `rust:1.90-trixie` being a floating tag whose underlying Debian
+  trixie/musl-cross-toolchain packages have moved since that original
+  session, not by anything code-side. Not chased further: this crate's own
+  code has zero new C-compilation surface (`hmac`/`sha2`/`ed25519-dalek`/
+  `rand`/`data-encoding` are all pure Rust), and the studio's authoritative
+  CI is Jenkins (`agent { label 'linux-build' }`), a different, real
+  environment this session cannot reach to cross-check — not this local
+  ad hoc Docker pull. Flagged for whoever next touches this crate's musl
+  job, not fixed here.
+
 ## Test coverage
 
-`cargo test` — 49 tests, all passing as of this writing:
+`cargo test` — 68 tests, all passing as of this writing:
 
 - `qr_payload`: the exact hub grammar (real-shaped payload, `wss://`
   production-style, param-order independence, extra-field tolerance) and
@@ -322,20 +521,56 @@ What was actually run here, not just claimed:
   persistence shape, and `redacted_debug` never leaking the bearer token.
 - `pairing`: the `MockPairClaimer`/`MockPendingPairingHandle` seam itself,
   each `PairOutcome` variant round-tripping through it.
+- `secret`: `load_or_create_secret` generate-then-reload stability (a
+  restart shows the same code), `0600` file permissions, the 5-groups/26-char
+  display shape, round-trip encode→decode across 20 varied byte patterns,
+  case-insensitivity (upper/lower/mixed), separator/whitespace tolerance,
+  Crockford's own `O`/`I`/`L` decode leniency, and rejection of both
+  wrong-length and out-of-alphabet input.
+- `local_account_binding`: the existing hub-mediated `new_active` round
+  trip (now also asserting `owner_pubkey` is `None` there), plus
+  `new_active_local` recording `owner_pubkey` as both that field and
+  `principal_id`.
+- `local_claim` (router-level, same `tower::ServiceExt::oneshot` pattern as
+  `handlers`'s own test module):
+  - happy-path round trip: `challenge` → `finish` → `200 claimed`,
+    `owner_pubkey` actually persisted in `LocalAccountBinding`, the
+    returned `box_proof` independently recomputed and matched, the secret
+    file gone, `is_claimed()` true;
+  - wrong `client_proof` → `401`, and — explicitly asserted, not assumed —
+    the secret file **still exists** afterward (a typo does not burn
+    onboarding);
+  - unknown `challenge_id` → `410`; an expired one (inserted already-past
+    a monotonic `Instant`, no real sleep needed) → `410` too (§9ii R3);
+  - already-claimed → `409` on both `challenge` and `finish`;
+  - non-LAN source → `403` on both routes;
+  - rate-limit budget exhausted → `429`;
+  - **§9ii R2's own required proof**: two genuinely concurrent (real
+    multi-threaded-runtime, real `tokio::spawn`) valid finishes for two
+    different owner keys against the same challenge resolve
+    first-writer-wins — exactly one `200`, exactly one `409`, and the
+    persisted `owner_pubkey` matches whichever one actually won, never a
+    torn or overwritten value.
 - `handlers` (router-level, via `tower::ServiceExt::oneshot` — see
   `src/handlers.rs`'s `oneshot_with_addr` helper for how `ConnectInfo` is
   injected without a real listener):
-  - fail-closed guard: an already-claimed box returns `409` and never
-    reaches `pair_claim` (the mock has no canned answer configured — if
-    the guard were broken, the mock would panic rather than silently
-    succeed);
+  - **§9ii R4's own required regression test**: a genuinely unclaimed,
+    offline box hitting the demoted `/v1/onboard/claim` gets `403
+    not_locally_claimed` and never reaches `pair_claim`, proven by the
+    response itself (a `403` precludes the `202`/`502` `pair_claim` would
+    otherwise produce) — replacing the old "already claimed → 409" test,
+    whose own precondition is no longer the anomaly under the new model;
   - non-LAN source → `403`;
   - malformed `qr_payload` → `400`;
   - missing `Content-Type` → `400`;
   - unknown JSON field → `400` (`deny_unknown_fields`);
   - successful claim → `202` immediately, without waiting on
-    `wait_for_result`;
-  - hub-unreachable → `502`, no state change;
+    `wait_for_result` (now run against a box pre-claimed locally, per the
+    new R4 precondition);
+  - hub-unreachable → `502`, no `pair-credentials` ever persisted (the box
+    was already locally claimed going in, per the new R4 precondition —
+    `is_claimed()` itself doesn't change on this path, hub-join simply
+    never completes);
   - `/healthz` → `200`, independent of LAN-source restriction.
   - the background task (`run_wait_for_result`, exercised directly, not
     only through the route) marks `claimed` and persists
@@ -374,12 +609,37 @@ Jenkinsfile either.
 - `benixos-pm` — sequencing this into the headless backlog, the
   `meta-benixos` dinit-unit + BitBake recipe work, and real LAN
   broadcast-and-connect verification (deferred items 2 and 3 of the
-  finalized contract's ticket).
+  finalized contract's ticket) — now including the local-only claim
+  protocol's own on-target verification (no real Courier client exists yet
+  to drive it end-to-end).
 - `data-architect` — `LocalAccountBinding`'s real, locked schema (this
-  crate's version is an explicit stand-in — see above).
+  crate's version is an explicit stand-in — see above), including whether
+  `owner_pubkey` (new in this pass) is the field's final shape.
 - `devops-engineer` — the dinit unit itself, its ordering against network
-  bring-up, and the `BENIX_MDNS_PORT` shared-env-var drift risk.
+  bring-up, the `BENIX_MDNS_PORT` shared-env-var drift risk, the state
+  directory's ownership (§9ii R5 sets its *mode* to `0700` from inside this
+  crate; *which user* the dinit unit runs as, so that mode is actually
+  meaningful, is a deployment decision this crate cannot and should not
+  force via `chown`), and this session's own unresolved local musl-build
+  toolchain finding (see "What was actually verified" above) if it turns
+  out to also affect a real Jenkins/GitHub Actions run.
 - `messaging-architect` + `benixos-pm` — whether `resource_advert`
   publishing eventually lands on this agent (expanded) or a separate
   post-claim daemon; if it's this agent, R1 (keyless) must be revisited
   before that expansion, per §9i.
+- `messaging-architect` + `data-architect` + `software-developer` — §9hh
+  Item 5 (join Hearth after a local claim): owner-signature
+  authentication for the demoted `/v1/onboard/claim`, and the
+  conditional-write-ordering discipline named in
+  `context/projects/benixos.md`'s own record (the ADR-0004 device-0
+  provisioning lesson) for registering against both local state and the
+  hub without a last-write-wins race.
+- `qa-engineer` — a full concurrency/race-condition test harness beyond
+  this PR's own single hand-written R2 regression test (§9ii's own
+  framing: "that harness is qa-engineer's to build; this section says what
+  must be proven").
+- **Courier-side** (different repo, `quickring/courier` or similar,
+  `quickring-pm`/`software-developer`) — the actual UI flow that reads the
+  box's displayed code, runs this two-step handshake, verifies `box_proof`,
+  and stores the box as an owned peer keyed by `box_pubkey`. Scoped under
+  QR-37 in §9hh's own text; nothing in this repo builds it.
