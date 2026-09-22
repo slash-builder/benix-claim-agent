@@ -15,11 +15,21 @@
 //! is no local integration target — see this crate's README for what's
 //! still owed on real hardware.
 //!
-//! This module was revised once already, against the Wave C security
+//! This module has been revised twice already, against the Wave C security
 //! review of the first version (`wiki/reports/
 //! standalone-first-wave-c-security-2026-09-22.md`, "CA-1" through "CA-4"
-//! below) — every doc comment citing "CA-N" is that review's finding, not
-//! a design choice invented here.
+//! below) and a security re-verification pass of that fix itself ("CA-1b")
+//! — every doc comment citing "CA-N" is one of those findings, not a
+//! design choice invented here.
+//!
+//! **CA-1b, unresolved on real hardware:** even with the CA-1 fix below,
+//! the exact `tpm2-tools` stdin-reading semantics for its `file:` auth
+//! format are **not confirmed against a real `tpm2-tools` build on
+//! venus**. This module's own best understanding, applied but not
+//! verified: hex-encoding text has no embedded `0x00`, so it survives any
+//! C-string-oriented read path intact, where raw binary would not. Confirm
+//! this against the actual tpm2-tools version BenixOS ships before this
+//! backend is exercised for real.
 //!
 //! ## The one property this module exists to hold
 //!
@@ -44,9 +54,15 @@
 //! or that sits unzeroized in a heap allocation, has not actually been
 //! discarded — an audit log or a debugger attached to this process would
 //! still see it. [`SystemTpm::discard_lockout_auth`] generates into a
-//! `Zeroizing<[u8; 32]>`, never encodes the bytes into a `String`, and
-//! hands them to `tpm2_changeauth` over the child process's stdin
-//! (`file:-`), never as a command-line argument.
+//! `Zeroizing<[u8; 32]>` and hands the value to `tpm2_changeauth` over the
+//! child process's stdin (`file:-`), never as a command-line argument.
+//! **CA-1b:** raw binary bytes over that stdin pipe are, per the Wave C
+//! re-verification, likely read through a C-string-oriented path in
+//! `tpm2-tools`' `file:` auth format — an embedded `0x00` would silently
+//! truncate `lockoutAuth` to whatever preceded it (about 1 claim in 256,
+//! for a uniformly random 32-byte value). The bytes are hex-encoded first,
+//! into a second `Zeroizing` buffer of their own, and *that* text — never
+//! the raw bytes — is what crosses the pipe.
 //!
 //! The trade-off is honest and irreversible — a later `TPM2_Clear` needs
 //! the platform/firmware hierarchy (a BIOS-level "clear TPM"), which wipes
@@ -232,8 +248,7 @@ impl TpmLockout for SystemTpm {
 
     fn discard_lockout_auth(&mut self) -> Result<(), TpmError> {
         // CA-2: generated straight into a Zeroizing buffer, and never
-        // copied into a String/Vec that wouldn't be zeroized on drop —
-        // there is no hex encoding step to leave a second heap copy of.
+        // copied into a String/Vec that wouldn't be zeroized on drop.
         let mut lockout_auth: Zeroizing<[u8; 32]> = Zeroizing::new([0u8; 32]);
         OsRng.fill_bytes(&mut *lockout_auth);
 
@@ -243,51 +258,96 @@ impl TpmLockout for SystemTpm {
         // setting R2 is scoped to. See venus-tpm2-sketch.sh's own T1 for
         // the full provisioning sequence this backend does not replicate.
         //
-        // CA-1: the new auth value is never a CLI argument. `file:-` tells
-        // tpm2_changeauth to read the raw auth bytes from stdin instead —
-        // this needs confirming against the tpm2-tools build actually
-        // shipped on venus (flagged, not verified here; no real hardware
-        // touched).
+        // CA-1/CA-1b: the new auth value is never a CLI argument, and it
+        // crosses the pipe hex-encoded (see `write_hex_auth_and_wait`'s own
+        // doc comment) — this needs confirming against the tpm2-tools
+        // build actually shipped on venus (flagged, not verified here; no
+        // real hardware touched).
         // CA-3: an absolute path (never resolved through an inherited
         // `PATH`), `env_clear()` (no inherited `TPM2TOOLS_TCTI` or
         // anything else an attacker-controlled parent environment could
         // set), and `--tcti` pinned explicitly to the exact device node
         // `detect()` itself already checked.
         let tcti = format!("device:{}", self.resource_manager_node.display());
-        let mut child = Command::new(TPM2_CHANGEAUTH_BIN)
-            .env_clear()
+        let mut cmd = Command::new(TPM2_CHANGEAUTH_BIN);
+        cmd.env_clear()
             .args(["--tcti", &tcti, "-c", "lockout", "file:-"])
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|_| TpmError::ChangeAuthFailed)?;
+            .stderr(Stdio::null());
 
-        let write_result = {
-            let Some(mut stdin) = child.stdin.take() else {
-                return Err(TpmError::ChangeAuthFailed);
-            };
-            // The Zeroizing buffer's contents go out over the pipe exactly
-            // once, to this one child process's stdin — never to argv,
-            // never to an env var, never logged. Dropping `stdin` here
-            // closes the write end, so the child sees EOF and proceeds.
-            stdin.write_all(&*lockout_auth)
-        };
-        // `lockout_auth` is zeroized on drop regardless of what happens
-        // below (Zeroizing's whole purpose) — nothing past this point
+        let result = write_hex_auth_and_wait(cmd, &*lockout_auth);
+        // `lockout_auth` is zeroized on drop regardless of what happened
+        // above (Zeroizing's whole purpose) — nothing past this point
         // needs to reference it again.
         drop(lockout_auth);
 
-        if write_result.is_err() {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(TpmError::ChangeAuthFailed);
+        match result {
+            Ok(true) => Ok(()),
+            Ok(false) | Err(_) => Err(TpmError::ChangeAuthFailed),
         }
+    }
+}
 
-        match child.wait() {
-            Ok(status) if status.success() => Ok(()),
-            _ => Err(TpmError::ChangeAuthFailed),
-        }
+/// Spawns `cmd` (already configured, including `.stdin(Stdio::piped())`),
+/// writes `secret` to its stdin **hex-encoded and prefixed `hex:`**, closes
+/// the pipe, and waits for the child to exit. Returns the child's own
+/// success/failure; `Err` only for a process-level failure (couldn't
+/// spawn, couldn't write, couldn't reap).
+///
+/// **CA-1b (Wave C re-verification):** raw bytes over stdin are, per that
+/// finding, likely read through a C-string-oriented path in `tpm2-tools`'
+/// `file:` auth format — an embedded `0x00` would silently truncate
+/// `lockoutAuth` to whatever preceded it (about 1 claim in 256, for a
+/// uniformly random 32-byte value). Hex text has no embedded NUL by
+/// construction, so the full value survives any such read intact. **Not
+/// confirmed against a real `tpm2-tools` build on venus** — this is this
+/// module's best understanding of the documented `hex:`/`file:` auth-value
+/// grammar, applied defensively, not a verified fact about the shipped
+/// binary.
+///
+/// Split out from [`SystemTpm::discard_lockout_auth`] so this exact
+/// stdin-writing behavior can be unit-tested against a harmless real
+/// subprocess (`tee`, in this module's own tests) instead of only against
+/// a real `tpm2_changeauth` this session can't reach.
+fn write_hex_auth_and_wait(mut cmd: Command, secret: &[u8]) -> Result<bool, TpmError> {
+    // Hex-encoded into ITS OWN Zeroizing buffer — manually, one byte at a
+    // time, rather than through `hex::encode` (which would allocate and
+    // return a plain, non-zeroizing `String` that this function would then
+    // have to copy out of and hope the original gets dropped promptly).
+    let mut hex_auth: Zeroizing<String> =
+        Zeroizing::new(String::with_capacity(4 + secret.len() * 2));
+    hex_auth.push_str("hex:");
+    for byte in secret {
+        // `write!` to a `String` cannot fail; the `Result` here is
+        // `Infallible` in practice.
+        let _ = std::fmt::Write::write_fmt(&mut *hex_auth, format_args!("{byte:02x}"));
+    }
+
+    let mut child = cmd.spawn().map_err(|_| TpmError::ChangeAuthFailed)?;
+
+    let write_result = {
+        let Some(mut stdin) = child.stdin.take() else {
+            return Err(TpmError::ChangeAuthFailed);
+        };
+        // The hex text crosses the pipe exactly once, to this one child
+        // process's stdin — never to argv, never to an env var, never
+        // logged. Dropping `stdin` here closes the write end, so the
+        // child sees EOF and proceeds.
+        stdin.write_all(hex_auth.as_bytes())
+    };
+    // Zeroized on drop regardless of what happens below.
+    drop(hex_auth);
+
+    if write_result.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(TpmError::ChangeAuthFailed);
+    }
+
+    match child.wait() {
+        Ok(status) => Ok(status.success()),
+        Err(_) => Err(TpmError::ChangeAuthFailed),
     }
 }
 
@@ -460,6 +520,55 @@ mod tests {
             hardware_signal_nodes: vec![hardware_signal],
         };
         assert_eq!(tpm.detect(), TpmPresence::PresentButUnavailable);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **CA-1b's own required regression test.** Spawns a real (harmless)
+    /// subprocess — `tee`, present on both this dev Mac and any Debian/
+    /// Yocto-derived Linux image — instead of a real `tpm2_changeauth`
+    /// this session can't reach, and asserts on the exact bytes it
+    /// actually received on stdin: a 32-byte value with an embedded
+    /// `0x00` in the middle, proving the full value crosses the pipe
+    /// hex-encoded rather than being truncated at the NUL the way raw
+    /// bytes read through a C-string-oriented path would be.
+    #[test]
+    fn write_hex_auth_and_wait_delivers_the_full_value_across_an_embedded_nul() {
+        let dir = std::env::temp_dir().join(format!(
+            "benix-claim-agent-tpm-stdin-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let captured_path = dir.join("captured-stdin");
+
+        let mut cmd = Command::new("tee");
+        cmd.arg(&captured_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        // CA-1b's exact failure mode: if this were read via a C-string
+        // path, a read would stop at byte index 5, delivering only 5
+        // bytes' worth of content instead of all 32.
+        let mut secret = [0xABu8; 32];
+        secret[5] = 0x00;
+        secret[6] = 0xCD;
+
+        let ok = write_hex_auth_and_wait(cmd, &secret).expect("tee should run cleanly");
+        assert!(ok, "tee should exit successfully");
+
+        let captured =
+            std::fs::read_to_string(&captured_path).expect("reading tee's captured output");
+        let expected = format!("hex:{}", hex::encode(secret));
+        assert_eq!(
+            captured, expected,
+            "the full 32 bytes, embedded 0x00 and all, must survive hex-encoded"
+        );
+        assert_eq!(
+            captured.len(),
+            4 + 64,
+            "hex: prefix plus exactly 64 hex characters for 32 bytes — not truncated"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
