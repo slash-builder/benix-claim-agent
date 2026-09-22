@@ -49,6 +49,7 @@ mod ratelimit;
 mod render;
 mod secret;
 mod state;
+mod tpm;
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -100,6 +101,12 @@ pub struct AppState {
     /// resolve first-writer-wins rather than racing on a plain
     /// check-then-write.
     pub claim_commit_lock: Mutex<()>,
+    /// R2 (`context/hot-decisions.md` "Standalone-first identity"): the
+    /// TPM lockout-discard seam `local_claim::local_claim_finish` calls as
+    /// part of claim completion. `Mutex` for interior mutability
+    /// (`TpmLockout::discard_lockout_auth` takes `&mut self`) behind the
+    /// shared `Arc<AppState>` every handler holds — see `src/tpm.rs`.
+    pub tpm: Mutex<Box<dyn tpm::TpmLockout>>,
 }
 
 fn init_tracing() {
@@ -231,6 +238,7 @@ async fn main() {
         secret,
         pending_challenges: PendingChallengeStore::new(),
         claim_commit_lock: Mutex::new(()),
+        tpm: Mutex::new(Box::new(tpm::SystemTpm::new())),
     });
 
     let router = build_router(app_state);

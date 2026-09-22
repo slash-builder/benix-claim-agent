@@ -279,6 +279,13 @@ mod tests {
             state_dir: dir,
             rate_limiter: RateLimiter::new(10),
             pair_claimer: Box::new(pair_claimer),
+            // This module's tests exercise the hub-mediated path
+            // (`onboard_claim`/`run_wait_for_result`), which never
+            // establishes initial ownership (§9ii R4) and so never reaches
+            // the R2 TPM step — see `local_claim.rs`'s own test module for
+            // that. `MockTpm::absent()` here is inert, not a claim this
+            // crate is asserting about.
+            tpm: std::sync::Mutex::new(Box::new(crate::tpm::MockTpm::absent())),
         })
     }
 
