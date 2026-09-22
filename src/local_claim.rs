@@ -474,6 +474,23 @@ pub async fn local_claim_finish(
                 }
             },
             TpmPresence::Absent => TpmCustodyState::NoTpmPresent,
+            // CA-4 (Wave C security review): hardware is present but this
+            // backend can't reach it (resource-manager device missing or
+            // permission-denied). This is NOT "no TPM" — treat it exactly
+            // like a discard failure, fail-closed, never silently
+            // downgraded to `NoTpmPresent`.
+            TpmPresence::PresentButUnavailable => {
+                drop(tpm);
+                drop(guard);
+                tracing::error!(
+                    "TPM hardware detected but its resource-manager device node is \
+                     unavailable — aborting the claim (fail-closed, box remains unclaimed, \
+                     never recorded as NoTpmPresent)"
+                );
+                return Err(AppError::Internal(
+                    "tpm present but resource manager unavailable".to_string(),
+                ));
+            }
         }
     };
 
@@ -1221,6 +1238,36 @@ mod tests {
             !state::local_account_binding_path(&dir).exists(),
             "a claim failure path must not persist a claim record at all"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// CA-4 (Wave C security review): "TPM hardware present but this
+    /// backend can't reach it" must abort the claim exactly like a discard
+    /// failure — never fall through to `discard_lockout_auth` at all
+    /// (which would be pointless against an unreachable device), and never
+    /// silently record `NoTpmPresent`.
+    #[tokio::test]
+    async fn tpm_present_but_unavailable_aborts_the_claim_and_never_calls_discard() {
+        let dir = temp_state_dir();
+        let mock = crate::tpm::MockTpm::present_but_unavailable();
+        let counter = mock.discard_call_counter();
+        let state = test_state_with_tpm(dir.clone(), 100, mock);
+
+        let response = run_happy_path_finish(&state).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "hardware detected but unreachable must abort the claim (fail-closed), the same \
+             as a discard failure"
+        );
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "discard_lockout_auth must never even be attempted against an unreachable TPM"
+        );
+        assert!(!state::is_claimed(&dir));
+        assert!(!state::local_account_binding_path(&dir).exists());
 
         std::fs::remove_dir_all(&dir).ok();
     }

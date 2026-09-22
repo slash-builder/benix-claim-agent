@@ -244,6 +244,26 @@ pub fn persist_local_account_binding(
     write_private_atomic(&state_dir.join(LOCAL_ACCOUNT_BINDING_FILENAME), &json)
 }
 
+/// Load the persisted `LocalAccountBinding`, if any. `Ok(None)` for a
+/// genuinely missing file (never claimed yet, or the local-claim path's
+/// own best-effort persist failed — see that call site's own comment);
+/// any other I/O or parse failure is a real `Err`.
+///
+/// **CA-6 (Wave C security review,
+/// `wiki/reports/standalone-first-wave-c-security-2026-09-22.md`):** added
+/// so `handlers::run_wait_for_result`'s hub-join path can read-modify-write
+/// instead of blindly overwriting — the hub join is the deferred
+/// Hearth-join step (§9hh Item 5), not an ownership-establishing event,
+/// and must never silently replace the local-only claim's `owner_pubkey`,
+/// `principal_id`, or `tpm_custody`.
+pub fn load_local_account_binding(state_dir: &Path) -> io::Result<Option<LocalAccountBinding>> {
+    match fs::read(state_dir.join(LOCAL_ACCOUNT_BINDING_FILENAME)) {
+        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// Test-only accessors for the two on-disk paths this module doesn't
 /// otherwise expose outside itself — production code has no reason to
 /// know these filenames beyond `is_claimed`/`mark_claimed`'s own API.

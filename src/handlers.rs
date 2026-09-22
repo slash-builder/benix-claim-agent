@@ -208,14 +208,43 @@ async fn run_wait_for_result(
                 return;
             }
 
-            let binding = LocalAccountBinding::new_active(
-                state.host_id.clone(),
-                creds.device_id.clone(),
-                state.device_name.clone(),
-                now_ms(),
-            );
-            if let Err(e) = state::persist_local_account_binding(&state.state_dir, &binding) {
-                tracing::error!(error = %e, "failed to persist local account binding after approval");
+            // CA-6 (Wave C security review,
+            // wiki/reports/standalone-first-wave-c-security-2026-09-22.md):
+            // the hub join is the deferred Hearth-join step (§9hh Item 5),
+            // not an ownership-establishing event. §9ii R4 already gates
+            // `onboard_claim` on a prior local claim, so a
+            // `LocalAccountBinding` should already exist — read-modify-
+            // write it, preserving `owner_pubkey`/`principal_id`/
+            // `tpm_custody` exactly as the local claim set them, and only
+            // recording the hub join alongside. If no binding exists (the
+            // local-claim path's own persist is best-effort — see its
+            // comment), refuse to mint one here: a binding whose only
+            // owner-shaped fields come from the hub's `device_id` would be
+            // an unconsented ownership transfer, not a join.
+            match state::load_local_account_binding(&state.state_dir) {
+                Ok(Some(mut binding)) => {
+                    binding.record_hub_join(creds.device_id.clone());
+                    if let Err(e) = state::persist_local_account_binding(&state.state_dir, &binding)
+                    {
+                        tracing::error!(
+                            error = %e,
+                            "failed to persist the hub join onto the existing local account binding"
+                        );
+                    }
+                }
+                Ok(None) => {
+                    tracing::error!(
+                        "hub join approved but no existing local account binding was found — \
+                         refusing to create one (CA-6: the hub join must never become the \
+                         record of device ownership)"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "failed to load the existing local account binding for the hub join"
+                    );
+                }
             }
         }
         Ok(PairOutcome::Rejected) => {
@@ -301,6 +330,28 @@ mod tests {
             .expect("mark_claimed_local for test setup");
     }
 
+    /// **CA-6 test setup**: a real local claim writes both the `claimed`
+    /// marker AND a `LocalAccountBinding` in the same critical section
+    /// (`local_claim.rs`) — so a realistic pre-hub-join fixture needs both,
+    /// not just [`mark_locally_claimed_for_test`]'s marker alone. Returns
+    /// the owner pubkey used, so tests can assert it survives the hub
+    /// join.
+    fn locally_claim_with_binding_for_test(dir: &std::path::Path) -> String {
+        let owner_pubkey = "test-owner-pubkey-base64".to_string();
+        state::mark_claimed_local(dir, &owner_pubkey, now_ms())
+            .expect("mark_claimed_local for test setup");
+        let binding = LocalAccountBinding::new_active_local(
+            "test-host".to_string(),
+            owner_pubkey.clone(),
+            "test-box".to_string(),
+            now_ms(),
+            crate::local_account_binding::TpmCustodyState::LockoutDiscarded,
+        );
+        state::persist_local_account_binding(dir, &binding)
+            .expect("persist local account binding for test setup");
+        owner_pubkey
+    }
+
     fn credentials() -> PairCredentials {
         PairCredentials {
             device_id: "device-42".to_string(),
@@ -321,6 +372,11 @@ mod tests {
     #[tokio::test]
     async fn background_task_marks_claimed_only_on_approved() {
         let dir = temp_state_dir();
+        // CA-6 (Wave C security review): realistic setup is a box that was
+        // already locally claimed (§9ii R4's own precondition for
+        // `onboard_claim` in the first place) — a hub join is a
+        // read-modify-write onto that existing binding, not a fresh mint.
+        let owner_pubkey = locally_claim_with_binding_for_test(&dir);
         let state = test_state(
             dir.clone(),
             MockPairClaimer::claim_ok_then(ack(), Ok(PairOutcome::Approved(credentials()))),
@@ -331,7 +387,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(!state::is_claimed(&dir));
+        assert!(
+            !state::pair_credentials_path(&dir).exists(),
+            "pair credentials must only appear once the background task actually runs"
+        );
         run_wait_for_result(
             Arc::clone(&state),
             pending,
@@ -342,6 +401,62 @@ mod tests {
         assert!(state::is_claimed(&dir));
         assert!(state::pair_credentials_path(&dir).exists());
         assert!(state::local_account_binding_path(&dir).exists());
+
+        // CA-6's own required proof: the hub join preserves the local
+        // claim's ownership fields and only records the hub join
+        // alongside them — it never becomes a new record of ownership.
+        let raw = std::fs::read_to_string(state::local_account_binding_path(&dir)).unwrap();
+        let binding: LocalAccountBinding = serde_json::from_str(&raw).unwrap();
+        assert_eq!(binding.owner_pubkey.as_deref(), Some(owner_pubkey.as_str()));
+        assert_eq!(binding.principal_id, owner_pubkey);
+        assert_eq!(
+            binding.tpm_custody,
+            Some(crate::local_account_binding::TpmCustodyState::LockoutDiscarded)
+        );
+        assert_eq!(binding.hub_device_id.as_deref(), Some("device-42"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **CA-6's own required regression test.** The local claim's own
+    /// `LocalAccountBinding` persist is best-effort (its own call site logs
+    /// and continues on failure — see `local_claim.rs`), so a box can in
+    /// principle reach `onboard_claim`'s §9ii R4 gate (satisfied by the
+    /// `claimed` marker alone) with no binding on disk. A hub join must
+    /// refuse to mint one from scratch in that case — a fresh binding
+    /// built only from the hub's own `device_id` would BE an unconsented
+    /// ownership record, not a join onto an existing one.
+    #[tokio::test]
+    async fn background_task_refuses_to_mint_a_binding_it_did_not_seed() {
+        let dir = temp_state_dir();
+        mark_locally_claimed_for_test(&dir); // claimed marker only — no LocalAccountBinding
+        assert!(!state::local_account_binding_path(&dir).exists());
+
+        let state = test_state(
+            dir.clone(),
+            MockPairClaimer::claim_ok_then(ack(), Ok(PairOutcome::Approved(credentials()))),
+        );
+        let (_, pending) = state
+            .pair_claimer
+            .pair_claim("wss://hub/v1", "sess-42", &state.keypair, "test-box")
+            .await
+            .unwrap();
+
+        run_wait_for_result(
+            Arc::clone(&state),
+            pending,
+            Duration::from_secs(1),
+            "sess-42".to_string(),
+        )
+        .await;
+
+        assert!(
+            !state::local_account_binding_path(&dir).exists(),
+            "a hub join with no existing local binding must not mint one (CA-6)"
+        );
+        // The rest of claim completion (the shared `claimed` marker, pair
+        // credentials) still happens — only the binding mint is refused.
+        assert!(state::pair_credentials_path(&dir).exists());
 
         std::fs::remove_dir_all(&dir).ok();
     }

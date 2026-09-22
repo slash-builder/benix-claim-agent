@@ -151,6 +151,18 @@ data-encoding = "2"
 # something heavy; it did not, so there was no reason to reach for it.
 qrcode = { version = "0.14", default-features = false }
 
+# --- TPM lockoutAuth custody (R2; Wave C security review CA-1/CA-2,
+# `feat/standalone-first-claim-owner`) ---
+# `Zeroizing<[u8; 32]>` for the generated `lockoutAuth` bytes in
+# `src/tpm.rs::SystemTpm::discard_lockout_auth` — a genuinely new
+# dependency, not a transitive promotion. Pure Rust, no_std-capable, no C
+# deps, no transitive dependencies of its own beyond an optional (unused
+# here) `zeroize_derive`. Preferred over a from-scratch `Drop` impl doing a
+# manual volatile-write loop, which is exactly the kind of "looks right,
+# quietly isn't" primitive this crate shouldn't hand-roll for a security
+# property (constant-time zeroing that the compiler can't optimize away).
+zeroize = "1"
+
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 tower = { version = "0.4", features = ["util"] }

@@ -15,6 +15,12 @@
 //! is no local integration target — see this crate's README for what's
 //! still owed on real hardware.
 //!
+//! This module was revised once already, against the Wave C security
+//! review of the first version (`wiki/reports/
+//! standalone-first-wave-c-security-2026-09-22.md`, "CA-1" through "CA-4"
+//! below) — every doc comment citing "CA-N" is that review's finding, not
+//! a design choice invented here.
+//!
 //! ## The one property this module exists to hold
 //!
 //! The TPM's own DA counter (`failedTries`, incremented on every wrong
@@ -34,10 +40,18 @@
 //! signature itself has no path for the bytes to reach a caller (there is
 //! no `-> WrappedKey`/`-> [u8; 32]` return), so `local_claim.rs`'s claim-
 //! completion step is structurally unable to leak them, not merely
-//! disciplined not to. The trade-off is honest and irreversible — a later
-//! `TPM2_Clear` needs the platform/firmware hierarchy (a BIOS-level "clear
-//! TPM"), which wipes every sealed key on the device — and that is the
-//! point (W4-G: "acceptable, and fail-closed").
+//! disciplined not to. **CA-1/CA-2 (Wave C):** a value that reaches argv,
+//! or that sits unzeroized in a heap allocation, has not actually been
+//! discarded — an audit log or a debugger attached to this process would
+//! still see it. [`SystemTpm::discard_lockout_auth`] generates into a
+//! `Zeroizing<[u8; 32]>`, never encodes the bytes into a `String`, and
+//! hands them to `tpm2_changeauth` over the child process's stdin
+//! (`file:-`), never as a command-line argument.
+//!
+//! The trade-off is honest and irreversible — a later `TPM2_Clear` needs
+//! the platform/firmware hierarchy (a BIOS-level "clear TPM"), which wipes
+//! every sealed key on the device — and that is the point (W4-G:
+//! "acceptable, and fail-closed").
 //!
 //! ## Why a trait
 //!
@@ -49,14 +63,43 @@
 //! exists and compiles, but its own correctness against a real TPM is
 //! explicitly **not verified by this pass** — see this crate's README.
 
+use std::io::Write as _;
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
+
 use rand::rngs::OsRng;
 use rand::RngCore;
+use zeroize::Zeroizing;
 
-/// Whether a TPM 2.0 was found on this box at claim time.
+/// Whether — and how safely — a TPM 2.0 was found on this box at claim
+/// time.
+///
+/// **CA-4 (Wave C):** the first version of this module collapsed "no TPM
+/// hardware" and "a TPM exists but this backend can't reach it" into the
+/// same `Absent` outcome. That's a silent downgrade: a box whose resource-
+/// manager device is missing, unbound, or permission-denied would record
+/// `NoTpmPresent` and proceed with no DA backstop, exactly as if it had no
+/// TPM at all. [`PresentButUnavailable`](TpmPresence::PresentButUnavailable)
+/// exists so the caller can refuse to proceed instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TpmPresence {
+    /// This backend's resource-managed device node opened successfully —
+    /// safe to call [`discard_lockout_auth`](TpmLockout::discard_lockout_auth).
     Present,
+    /// No TPM hardware signal was found at all (no sysfs `tpm` class
+    /// device, no raw `/dev/tpm*` node). A genuinely TPM-less box — safe to
+    /// record [`TpmCustodyState::NoTpmPresent`][ncs] and proceed; there is
+    /// nothing this backend could have reached anyway.
+    ///
+    /// [ncs]: crate::local_account_binding::TpmCustodyState::NoTpmPresent
     Absent,
+    /// Hardware-presence signals exist (a sysfs `tpm` class device, or a
+    /// raw `/dev/tpm0`), but the resource-managed device node this backend
+    /// actually needs is missing or not accessible (e.g. permission
+    /// denied). **The caller MUST treat this as a claim-aborting failure,
+    /// the same as a `discard_lockout_auth` error** — never fall back to
+    /// `Absent`.
+    PresentButUnavailable,
 }
 
 /// Deliberately generic: never carries the attempted `lockoutAuth` value,
@@ -86,13 +129,17 @@ impl std::fmt::Display for TpmError {
 /// `AppState`'s `Mutex<Box<dyn TpmLockout>>`, shared across the async
 /// handlers `Arc<AppState>` reaches.
 pub trait TpmLockout: Send {
-    /// Cheap and read-only: is a TPM 2.0 present on this box? Must never
-    /// mutate any TPM state, and must never touch `lockoutAuth`.
+    /// Cheap and read-only: what TPM state is this box in? Must never
+    /// mutate any TPM state, and must never touch `lockoutAuth`. See
+    /// [`TpmPresence`]'s own doc comment for the three-way distinction
+    /// callers must respect (CA-4).
     fn detect(&self) -> TpmPresence;
 
     /// Set `lockoutAuth` to 32 bytes of CSPRNG output and discard them
     /// within this same call — no implementation may return, log, or
-    /// persist the bytes, on success or on failure.
+    /// persist the bytes, on success or on failure, and no implementation
+    /// may put them on a command line or in an environment variable
+    /// (CA-1) or leave them in an unzeroized heap allocation (CA-2).
     fn discard_lockout_auth(&mut self) -> Result<(), TpmError>;
 }
 
@@ -104,31 +151,45 @@ pub trait TpmLockout: Send {
 /// here" for what a real venus run still owes (T0 read-only first, to
 /// confirm an fTPM/dTPM and read `lockoutAuthSet`, per W4-G's own
 /// escalation to devops-engineer).
-///
-/// **Known limitation, flagged not fixed in this pass**: the generated
-/// bytes exist as a `String` (hex, for the one `tpm2_changeauth` CLI
-/// argument they must become) for the duration of the subprocess call.
-/// They are zeroed in the `[u8; 32]` source buffer immediately after
-/// encoding and the `String` is dropped as soon as the call returns, but
-/// Rust gives no guarantee that dropping a `String` actually overwrites
-/// its heap allocation (no `zeroize`/`secrecy` dependency is added here to
-/// close that gap — this backend is unexercised by this pass, and adding
-/// a new dependency for it is a call for whoever next touches this crate's
-/// musl job and real-hardware verification, not this pass).
 pub struct SystemTpm {
-    /// The resource-manager device node [`detect`](TpmLockout::detect)
-    /// checks. A field, not a hardcoded constant, so a future `swtpm`-
-    /// backed integration test could point this at a chardev without
-    /// touching real hardware — unused by this session's own test suite
-    /// (no `swtpm` binary available here; `MockTpm` is what exercises the
+    /// The resource-manager device node this backend both probes in
+    /// [`detect`](TpmLockout::detect) and pins explicitly via `--tcti` in
+    /// [`discard_lockout_auth`](TpmLockout::discard_lockout_auth) (CA-3: an
+    /// inherited `TPM2TOOLS_TCTI` could be pointed at a spoofed
+    /// `swtpm`/software TCTI that returns success unconditionally). A
+    /// field, not a hardcoded constant, so a future `swtpm`-backed
+    /// integration test could point this at a chardev without touching
+    /// real hardware — unused by this session's own test suite (no
+    /// `swtpm` binary available here; `MockTpm` is what exercises the
     /// trait instead).
-    device_node: std::path::PathBuf,
+    resource_manager_node: PathBuf,
+    /// CA-4: independent hardware-presence signals, consulted only when
+    /// `resource_manager_node` itself doesn't open, so "no TPM" and "TPM
+    /// present but the resource manager device is unavailable" are never
+    /// conflated. The kernel's sysfs `tpm` class device and the raw
+    /// (non-resource-managed) `/dev/tpm0` node are both independent of
+    /// whether the resource-manager daemon/kernel driver for `tpmrm0`
+    /// happens to be bound.
+    hardware_signal_nodes: Vec<PathBuf>,
 }
+
+/// **Not verified against the real BenixOS image layout — this pass never
+/// touched venus.** `tpm2-tools` packages typically install here on a
+/// Debian/Yocto-derived rootfs, but confirm the actual installed path
+/// before this backend is exercised for real (this crate's README "Open,
+/// routed rather than decided here"). An absolute path is load-bearing
+/// (CA-3): resolving through an inherited, attacker-influenced `PATH`
+/// would let a spoofed binary claim success.
+const TPM2_CHANGEAUTH_BIN: &str = "/usr/bin/tpm2_changeauth";
 
 impl SystemTpm {
     pub fn new() -> Self {
         Self {
-            device_node: std::path::PathBuf::from("/dev/tpmrm0"),
+            resource_manager_node: PathBuf::from("/dev/tpmrm0"),
+            hardware_signal_nodes: vec![
+                PathBuf::from("/sys/class/tpm/tpm0"),
+                PathBuf::from("/dev/tpm0"),
+            ],
         }
     }
 }
@@ -141,32 +202,90 @@ impl Default for SystemTpm {
 
 impl TpmLockout for SystemTpm {
     fn detect(&self) -> TpmPresence {
-        if self.device_node.exists() {
-            TpmPresence::Present
-        } else {
-            TpmPresence::Absent
+        // CA-4: open (read+write, the same access discard_lockout_auth's
+        // subprocess will need), not just `Path::exists`, so a node that
+        // exists but is permission-denied is distinguished from one that
+        // opens cleanly — `exists()` alone can't tell those apart.
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.resource_manager_node)
+        {
+            Ok(_handle) => TpmPresence::Present,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if self.hardware_signal_nodes.iter().any(|p| p.exists()) {
+                    // The kernel sees TPM hardware, but the resource
+                    // manager node isn't there (driver/daemon not bound
+                    // yet, or a genuinely broken image) — CA-4, never
+                    // `Absent`.
+                    TpmPresence::PresentButUnavailable
+                } else {
+                    TpmPresence::Absent
+                }
+            }
+            // Any other failure to open an *existing* node — permission
+            // denied is the expected real-world case — is the same
+            // "present but unreachable" outcome, never `Absent`.
+            Err(_) => TpmPresence::PresentButUnavailable,
         }
     }
 
     fn discard_lockout_auth(&mut self) -> Result<(), TpmError> {
-        let mut lockout_auth = [0u8; 32];
-        OsRng.fill_bytes(&mut lockout_auth);
-        let hex_auth = format!("hex:{}", hex::encode(lockout_auth));
-        lockout_auth.fill(0);
+        // CA-2: generated straight into a Zeroizing buffer, and never
+        // copied into a String/Vec that wouldn't be zeroized on drop —
+        // there is no hex encoding step to leave a second heap copy of.
+        let mut lockout_auth: Zeroizing<[u8; 32]> = Zeroizing::new([0u8; 32]);
+        OsRng.fill_bytes(&mut *lockout_auth);
 
         // tpm2_dictionarylockout -s -n 10 -t 7200 -l 86400 (the DA policy
         // itself) is provisioning, not claim-time, and is deliberately not
         // run here — this call only ever touches lockoutAuth, the one
         // setting R2 is scoped to. See venus-tpm2-sketch.sh's own T1 for
         // the full provisioning sequence this backend does not replicate.
-        let result = std::process::Command::new("tpm2_changeauth")
-            .args(["-c", "lockout", &hex_auth])
-            .output();
-        // Nothing below this line may reference `hex_auth` again.
-        drop(hex_auth);
+        //
+        // CA-1: the new auth value is never a CLI argument. `file:-` tells
+        // tpm2_changeauth to read the raw auth bytes from stdin instead —
+        // this needs confirming against the tpm2-tools build actually
+        // shipped on venus (flagged, not verified here; no real hardware
+        // touched).
+        // CA-3: an absolute path (never resolved through an inherited
+        // `PATH`), `env_clear()` (no inherited `TPM2TOOLS_TCTI` or
+        // anything else an attacker-controlled parent environment could
+        // set), and `--tcti` pinned explicitly to the exact device node
+        // `detect()` itself already checked.
+        let tcti = format!("device:{}", self.resource_manager_node.display());
+        let mut child = Command::new(TPM2_CHANGEAUTH_BIN)
+            .env_clear()
+            .args(["--tcti", &tcti, "-c", "lockout", "file:-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|_| TpmError::ChangeAuthFailed)?;
 
-        match result {
-            Ok(output) if output.status.success() => Ok(()),
+        let write_result = {
+            let Some(mut stdin) = child.stdin.take() else {
+                return Err(TpmError::ChangeAuthFailed);
+            };
+            // The Zeroizing buffer's contents go out over the pipe exactly
+            // once, to this one child process's stdin — never to argv,
+            // never to an env var, never logged. Dropping `stdin` here
+            // closes the write end, so the child sees EOF and proceeds.
+            stdin.write_all(&*lockout_auth)
+        };
+        // `lockout_auth` is zeroized on drop regardless of what happens
+        // below (Zeroizing's whole purpose) — nothing past this point
+        // needs to reference it again.
+        drop(lockout_auth);
+
+        if write_result.is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(TpmError::ChangeAuthFailed);
+        }
+
+        match child.wait() {
+            Ok(status) if status.success() => Ok(()),
             _ => Err(TpmError::ChangeAuthFailed),
         }
     }
@@ -212,6 +331,15 @@ impl MockTpm {
         Self::new(TpmPresence::Absent, false)
     }
 
+    /// CA-4: hardware detected, but this backend can't reach it (resource
+    /// manager device missing/permission-denied). `discard_lockout_auth`
+    /// is never expected to be called against this variant — the caller
+    /// must abort on `detect()` alone — so it's configured to fail loudly
+    /// if it somehow is.
+    pub fn present_but_unavailable() -> Self {
+        Self::new(TpmPresence::PresentButUnavailable, true)
+    }
+
     fn new(presence: TpmPresence, fail_change_auth: bool) -> Self {
         Self {
             presence,
@@ -243,12 +371,16 @@ impl TpmLockout for MockTpm {
         if self.fail_change_auth {
             return Err(TpmError::ChangeAuthFailed);
         }
-        // Model the real backend's own shape (generate, then immediately
-        // discard) even though nothing here needs real entropy — proves
-        // the mock isn't a no-op stand-in for what production code does.
-        let mut bytes = [0u8; 32];
-        OsRng.fill_bytes(&mut bytes);
-        bytes.fill(0);
+        // Model the real backend's own shape (generate into a Zeroizing
+        // buffer, then let it drop) even though nothing here needs real
+        // entropy — proves the mock isn't a no-op stand-in for what
+        // production code does.
+        let bytes: Zeroizing<[u8; 32]> = {
+            let mut b = Zeroizing::new([0u8; 32]);
+            OsRng.fill_bytes(&mut *b);
+            b
+        };
+        drop(bytes);
         Ok(())
     }
 }
@@ -274,6 +406,13 @@ mod tests {
     }
 
     #[test]
+    fn mock_present_but_unavailable_is_distinct_from_absent() {
+        let tpm = MockTpm::present_but_unavailable();
+        assert_eq!(tpm.detect(), TpmPresence::PresentButUnavailable);
+        assert_ne!(tpm.detect(), TpmPresence::Absent);
+    }
+
+    #[test]
     fn mock_present_but_failing_returns_change_auth_failed() {
         let mut tpm = MockTpm::present_but_failing();
         let counter = tpm.discard_call_counter();
@@ -292,10 +431,36 @@ mod tests {
 
     #[test]
     fn system_tpm_absent_device_node_reports_absence() {
-        // SystemTpm::new() always points at /dev/tpmrm0; this environment
-        // has no TPM, so detect() must honestly report absence rather than
-        // guessing present. Confirms the real backend's read-only detect
-        // path is safe to construct and call even off-hardware.
+        // SystemTpm::new() points at /dev/tpmrm0 plus the sysfs/raw
+        // hardware-signal nodes; this environment (a Mac, no TPM at all)
+        // has none of them, so detect() must honestly report absence
+        // rather than guessing present or unavailable. Confirms the real
+        // backend's read-only detect path is safe to construct and call
+        // even off-hardware.
         assert_eq!(SystemTpm::new().detect(), TpmPresence::Absent);
+    }
+
+    #[test]
+    fn system_tpm_reports_present_but_unavailable_when_only_hardware_signals_exist() {
+        // CA-4's own regression test: a resource-manager node that isn't
+        // there, but a hardware-signal node that is, must never collapse
+        // to `Absent`. Uses this OS's real filesystem (a tempfile standing
+        // in for "/dev/tpm0", not real hardware) rather than adding a
+        // dependency-injection seam SystemTpm doesn't otherwise need.
+        let dir = std::env::temp_dir().join(format!(
+            "benix-claim-agent-tpm-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let hardware_signal = dir.join("tpm0");
+        std::fs::write(&hardware_signal, b"").unwrap();
+
+        let tpm = SystemTpm {
+            resource_manager_node: dir.join("tpmrm0-does-not-exist"),
+            hardware_signal_nodes: vec![hardware_signal],
+        };
+        assert_eq!(tpm.detect(), TpmPresence::PresentButUnavailable);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

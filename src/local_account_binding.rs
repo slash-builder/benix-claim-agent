@@ -166,6 +166,14 @@ pub struct LocalAccountBinding {
     /// [`HouseholdDelegationGrant`]'s own doc comment for why.
     #[serde(default)]
     pub household_delegation: Option<HouseholdDelegationGrant>,
+    /// **CA-6 (Wave C security review):** the hub `device_id` a deferred
+    /// Hearth-join (§9hh Item 5, `handlers::run_wait_for_result`) recorded
+    /// against this box, alongside — never instead of — the local claim's
+    /// own `owner_pubkey`/`principal_id`/`tpm_custody`. `None` until a hub
+    /// join actually happens. See
+    /// [`record_hub_join`](Self::record_hub_join).
+    #[serde(default)]
+    pub hub_device_id: Option<String>,
 }
 
 impl LocalAccountBinding {
@@ -192,6 +200,7 @@ impl LocalAccountBinding {
             owner_pubkey: None,
             tpm_custody: None,
             household_delegation: None,
+            hub_device_id: None,
         }
     }
 
@@ -228,7 +237,20 @@ impl LocalAccountBinding {
             owner_pubkey: Some(owner_pubkey),
             tpm_custody: Some(tpm_custody),
             household_delegation: None,
+            hub_device_id: None,
         }
+    }
+
+    /// **CA-6 (Wave C security review):** the read-modify-write step
+    /// `handlers::run_wait_for_result` applies to an *existing* binding on
+    /// a successful hub-mediated join — never a constructor that could
+    /// stand in for one. Updates only `hub_device_id`; `owner_pubkey`,
+    /// `principal_id`, `tpm_custody`, and `household_delegation` are left
+    /// exactly as the local-only claim set them. Idempotent: joining twice
+    /// (or re-joining after a hub-side account change) just overwrites the
+    /// previously-recorded hub identity, never the owner.
+    pub fn record_hub_join(&mut self, hub_device_id: String) {
+        self.hub_device_id = Some(hub_device_id);
     }
 }
 
