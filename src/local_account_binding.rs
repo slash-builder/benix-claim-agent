@@ -49,6 +49,67 @@ use serde::{Deserialize, Serialize};
 /// field set changes before a real schema supersedes it entirely.
 pub const SCHEMA_VERSION: u32 = 0;
 
+/// R2 (`context/hot-decisions.md` "Standalone-first identity";
+/// `working-memory-poc`'s `findings/W4-G-key-custody.md`): whether this
+/// box's TPM 2.0 `lockoutAuth` was randomized and discarded as part of
+/// claim completion. Recorded so the state a box actually claimed in is
+/// visible later — never a byte of the discarded value itself, which no
+/// part of this crate ever holds past `crate::tpm::TpmLockout::
+/// discard_lockout_auth`'s own call frame (see that module's doc comment).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TpmCustodyState {
+    /// A TPM 2.0 was present at claim time and its `lockoutAuth` was set
+    /// to CSPRNG bytes and discarded in the same claim-completion step —
+    /// device-root can no longer reset the TPM's dictionary-attack
+    /// counter, so it becomes a real (if device-global, not
+    /// per-principal — W4-G) hardware attempt limit.
+    LockoutDiscarded,
+    /// No TPM 2.0 was detected at claim time. This is recorded, not
+    /// treated as a claim failure (a box with no TPM is still a valid
+    /// claim) — but it means this box has no hardware attempt-limit
+    /// backstop: a software key-wrap backend here is `offline_guessable`
+    /// (W4-G's `CustodyProperties`) and callers must not treat it as
+    /// DA-protected.
+    NoTpmPresent,
+}
+
+/// R1/R2 (`context/hot-decisions.md` "Standalone-first identity"): a
+/// device's owner is always a **person**, never a household — "device-root
+/// is a capability grant held by that owner, delegable ... to one
+/// household or to individuals." This crate's own owner fields
+/// (`principal_id`, `owner_pubkey` below) already carry a person's
+/// identity by construction (a hub `account_id`, or the Ed25519 public key
+/// Courier proved possession-adjacent trust for — never a household id),
+/// so this type isn't a new owner representation; it's the typed hook for
+/// the *separate* record R2 requires: delegating some of that ownership to
+/// a household.
+///
+/// **No grant store exists for this crate to write to.** Checked before
+/// adding this: `slash-builder/identity-kit` has `family`/`authz` modules
+/// with household/grant-shaped concepts (`FamilyClient`,
+/// `JoinHouseholdRequest`, `Capabilities`), but this crate has no
+/// dependency on `identity-kit` today, and wiring one in is a real
+/// cross-Kit dependency decision this scoped pass doesn't make
+/// unilaterally. So this stays a typed hook: the shape a household
+/// delegation grant would take if/when a real store exists, always `None`
+/// today, and never populated by any code in this crate.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HouseholdDelegationGrant {
+    /// The household this owner has delegated a scoped set of device-root
+    /// to. Matches the shared data model's `household.hid` (`retired ids
+    /// are never reused`) — a plain string here since this crate has no
+    /// household type of its own to borrow.
+    pub household_id: String,
+    /// The scoped capability set delegated (R2: "install, users, network,
+    /// updates"), not full device-root. Free-form strings rather than a
+    /// closed enum — this crate doesn't own that vocabulary, and
+    /// inventing one here would be exactly the kind of Kit-logic fork the
+    /// studio convention forbids.
+    pub scope: Vec<String>,
+    pub granted_at_ms: i64,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AccountClass {
@@ -82,54 +143,63 @@ pub struct LocalAccountBinding {
     /// The local-only claim protocol's owner credential
     /// (`context/projects/benixos.md` §9hh): the Ed25519 public key
     /// Courier proved possession-adjacent trust for during
-    /// `POST /v1/onboard/local-claim/finish`, base64-encoded. `None` for a
-    /// hub-mediated binding ([`new_active`](Self::new_active)) — that
-    /// path's owner is the hub `account_id`/`principal_id` pair instead,
-    /// not a bare public key. Routed to data-architect, same as every
-    /// other field in this stand-in — not this crate's schema to
-    /// finalize.
+    /// `POST /v1/onboard/local-claim/finish`, base64-encoded. Set only by
+    /// [`new_active_local`](Self::new_active_local) — the hub-mediated join
+    /// (`handlers::run_wait_for_result`) never constructs a fresh binding
+    /// of its own (CA-6, Wave C security review: that would silently
+    /// replace this field with the hub's `device_id`); it read-modify-
+    /// writes the existing one via [`record_hub_join`](Self::record_hub_join)
+    /// instead, which never touches `owner_pubkey`. Routed to
+    /// data-architect, same as every other field in this stand-in — not
+    /// this crate's schema to finalize.
     #[serde(default)]
     pub owner_pubkey: Option<String>,
+    /// R2: this box's TPM custody state as of claim completion. Set only by
+    /// [`new_active_local`](Self::new_active_local) — see `owner_pubkey`'s
+    /// own doc comment above for why the hub-mediated join never
+    /// constructs this field itself. See `crate::tpm` for the trait this
+    /// state comes from.
+    #[serde(default)]
+    pub tpm_custody: Option<TpmCustodyState>,
+    /// R1/R2 typed hook, always `None` today — see
+    /// [`HouseholdDelegationGrant`]'s own doc comment for why.
+    #[serde(default)]
+    pub household_delegation: Option<HouseholdDelegationGrant>,
+    /// **CA-6 (Wave C security review):** the hub `device_id` a deferred
+    /// Hearth-join (§9hh Item 5, `handlers::run_wait_for_result`) recorded
+    /// against this box, alongside — never instead of — the local claim's
+    /// own `owner_pubkey`/`principal_id`/`tpm_custody`. `None` until a hub
+    /// join actually happens. See
+    /// [`record_hub_join`](Self::record_hub_join).
+    #[serde(default)]
+    pub hub_device_id: Option<String>,
 }
 
 impl LocalAccountBinding {
-    /// Build the binding this agent creates on `PairOutcome::Approved` (the
-    /// **hub-mediated** path, §9j) — always fresh, always `Active`, never
-    /// revoked at construction. See [`new_active_local`](Self::new_active_local)
-    /// for the local-only claim protocol's (§9hh) counterpart.
-    pub fn new_active(
-        host_id: String,
-        principal_id: String,
-        local_username: String,
-        created_at_ms: i64,
-    ) -> Self {
-        Self {
-            schema_version: SCHEMA_VERSION,
-            host_id,
-            principal_id,
-            local_uid: None,
-            local_username,
-            account_class: AccountClass::Interactive,
-            status: BindingStatus::Active,
-            created_at_ms,
-            revoked_at_ms: None,
-            owner_pubkey: None,
-        }
-    }
-
     /// Build the binding the local-only claim protocol (§9hh) creates on a
-    /// successful `POST /v1/onboard/local-claim/finish` — the local
-    /// counterpart to [`new_active`](Self::new_active). There is no
-    /// hub-assigned `principal_id` to project in this path (no hub is
-    /// involved at all): `principal_id` is set to `owner_pubkey` itself,
+    /// successful `POST /v1/onboard/local-claim/finish` — the **only**
+    /// constructor this crate has. CA-6 (Wave C security review) removed
+    /// the hub-mediated path's own `new_active` fresh-binding constructor:
+    /// a hub-mediated join is a read-modify-write onto a binding this
+    /// constructor already created, via [`record_hub_join`](Self::record_hub_join),
+    /// never a fresh mint of its own — see that method's doc comment.
+    /// There is no hub-assigned `principal_id` to project in this path (no
+    /// hub is involved at all): `principal_id` is set to `owner_pubkey`
+    /// itself,
     /// since the owner's public key *is* the principal this claim
     /// establishes (matching the studio's Ed25519-everywhere principal
-    /// model — a fabric `device_id` is itself a public key).
+    /// model — a fabric `device_id` is itself a public key). `tpm_custody`
+    /// is required (not optional) here because this is the one path where
+    /// initial ownership, and the R2 TPM step, actually happen —
+    /// `local_claim.rs`'s claim-completion step has always already decided
+    /// it (`TpmCustodyState::LockoutDiscarded` or `NoTpmPresent`) by the
+    /// time this constructor runs.
     pub fn new_active_local(
         host_id: String,
         owner_pubkey: String,
         local_username: String,
         created_at_ms: i64,
+        tpm_custody: TpmCustodyState,
     ) -> Self {
         Self {
             schema_version: SCHEMA_VERSION,
@@ -142,7 +212,22 @@ impl LocalAccountBinding {
             created_at_ms,
             revoked_at_ms: None,
             owner_pubkey: Some(owner_pubkey),
+            tpm_custody: Some(tpm_custody),
+            household_delegation: None,
+            hub_device_id: None,
         }
+    }
+
+    /// **CA-6 (Wave C security review):** the read-modify-write step
+    /// `handlers::run_wait_for_result` applies to an *existing* binding on
+    /// a successful hub-mediated join — never a constructor that could
+    /// stand in for one. Updates only `hub_device_id`; `owner_pubkey`,
+    /// `principal_id`, `tpm_custody`, and `household_delegation` are left
+    /// exactly as the local-only claim set them. Idempotent: joining twice
+    /// (or re-joining after a hub-side account change) just overwrites the
+    /// previously-recorded hub identity, never the owner.
+    pub fn record_hub_join(&mut self, hub_device_id: String) {
+        self.hub_device_id = Some(hub_device_id);
     }
 }
 
@@ -150,22 +235,31 @@ impl LocalAccountBinding {
 mod tests {
     use super::*;
 
+    /// CA-6 (Wave C security review) unit-level proof: `record_hub_join`
+    /// only ever touches `hub_device_id` — every field the local-only
+    /// claim set survives, byte for byte. The integration-level version of
+    /// this (through the actual hub-mediated HTTP flow) lives in
+    /// `handlers.rs`'s own test module.
     #[test]
-    fn new_active_binding_round_trips_through_json() {
-        let binding = LocalAccountBinding::new_active(
+    fn record_hub_join_touches_only_hub_device_id() {
+        let mut binding = LocalAccountBinding::new_active_local(
             "venus".to_string(),
-            "device-abc123".to_string(),
+            "QW5FeGFtcGxlUHVia2V5Qnl0ZXM=".to_string(),
             "benix-box".to_string(),
             1_700_000_000_000,
+            TpmCustodyState::LockoutDiscarded,
         );
-        let json = serde_json::to_string(&binding).expect("serialize");
-        let back: LocalAccountBinding = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(back.host_id, "venus");
-        assert_eq!(back.principal_id, "device-abc123");
-        assert_eq!(back.status, BindingStatus::Active);
-        assert!(back.revoked_at_ms.is_none());
-        assert!(back.local_uid.is_none());
-        assert!(back.owner_pubkey.is_none());
+        let before = binding.clone();
+
+        binding.record_hub_join("hub-device-42".to_string());
+
+        assert_eq!(binding.hub_device_id.as_deref(), Some("hub-device-42"));
+        assert_eq!(binding.owner_pubkey, before.owner_pubkey);
+        assert_eq!(binding.principal_id, before.principal_id);
+        assert_eq!(binding.tpm_custody, before.tpm_custody);
+        assert_eq!(binding.household_delegation, before.household_delegation);
+        assert_eq!(binding.created_at_ms, before.created_at_ms);
+        assert_eq!(binding.status, before.status);
     }
 
     #[test]
@@ -175,6 +269,7 @@ mod tests {
             "QW5FeGFtcGxlUHVia2V5Qnl0ZXM=".to_string(),
             "benix-box".to_string(),
             1_700_000_000_000,
+            TpmCustodyState::LockoutDiscarded,
         );
         let json = serde_json::to_string(&binding).expect("serialize");
         let back: LocalAccountBinding = serde_json::from_str(&json).expect("deserialize");
@@ -185,5 +280,35 @@ mod tests {
         );
         assert_eq!(back.principal_id, "QW5FeGFtcGxlUHVia2V5Qnl0ZXM=");
         assert_eq!(back.status, BindingStatus::Active);
+        assert_eq!(back.tpm_custody, Some(TpmCustodyState::LockoutDiscarded));
+        // R1: the owner named on the claim record is a person (a bare
+        // account/principal id), never a household — and no delegation
+        // exists yet, since this crate has no grant store to write one to.
+        assert!(back.household_delegation.is_none());
+    }
+
+    #[test]
+    fn no_tpm_present_is_recorded_not_treated_as_a_failure() {
+        let binding = LocalAccountBinding::new_active_local(
+            "venus".to_string(),
+            "QW5FeGFtcGxlUHVia2V5Qnl0ZXM=".to_string(),
+            "benix-box".to_string(),
+            1_700_000_000_000,
+            TpmCustodyState::NoTpmPresent,
+        );
+        assert_eq!(binding.status, BindingStatus::Active);
+        assert_eq!(binding.tpm_custody, Some(TpmCustodyState::NoTpmPresent));
+    }
+
+    #[test]
+    fn tpm_custody_serializes_as_a_bare_tag_never_a_byte_payload() {
+        // Guards the property `crate::tpm`'s doc comment leans on: there is
+        // no field anywhere in this record shaped to hold the discarded
+        // lockoutAuth bytes. If a future edit adds one, this test's
+        // hardcoded expected JSON breaks loudly.
+        let json = serde_json::to_string(&TpmCustodyState::LockoutDiscarded).unwrap();
+        assert_eq!(json, "\"lockout_discarded\"");
+        let json = serde_json::to_string(&TpmCustodyState::NoTpmPresent).unwrap();
+        assert_eq!(json, "\"no_tpm_present\"");
     }
 }

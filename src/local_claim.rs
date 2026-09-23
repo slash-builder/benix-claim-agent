@@ -102,8 +102,9 @@ use sha2::Sha256;
 use uuid::Uuid;
 
 use crate::error::AppError;
-use crate::local_account_binding::LocalAccountBinding;
+use crate::local_account_binding::{LocalAccountBinding, TpmCustodyState};
 use crate::state;
+use crate::tpm::TpmPresence;
 use crate::AppState;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -444,6 +445,55 @@ pub async fn local_claim_finish(
         return Err(AppError::AlreadyClaimed);
     }
 
+    // R2 (`context/hot-decisions.md` "Standalone-first identity"): the TPM
+    // lockout-discard step runs here, inside the same commit-lock-guarded
+    // critical section as the rest of claim completion, and BEFORE the
+    // claimed marker is written. If a TPM is present and the discard
+    // fails, the claim is aborted (fail-closed) — the box is never marked
+    // claimed on this path, so there is no "claimed, but with an
+    // unresolved TPM lockout state" outcome to leave behind. The trait
+    // (`crate::tpm::TpmLockout`) has no return path for the generated
+    // bytes at all, so this call site is structurally unable to log or
+    // persist them even by accident — see `src/tpm.rs`'s own doc comment.
+    let tpm_custody = {
+        let mut tpm = state.tpm.lock().expect("tpm lock");
+        match tpm.detect() {
+            TpmPresence::Present => match tpm.discard_lockout_auth() {
+                Ok(()) => TpmCustodyState::LockoutDiscarded,
+                Err(e) => {
+                    drop(tpm);
+                    drop(guard);
+                    tracing::error!(
+                        error = %e,
+                        "TPM present but lockoutAuth discard failed — aborting the claim \
+                         (fail-closed, box remains unclaimed)"
+                    );
+                    return Err(AppError::Internal(
+                        "tpm lockout provisioning failed".to_string(),
+                    ));
+                }
+            },
+            TpmPresence::Absent => TpmCustodyState::NoTpmPresent,
+            // CA-4 (Wave C security review): hardware is present but this
+            // backend can't reach it (resource-manager device missing or
+            // permission-denied). This is NOT "no TPM" — treat it exactly
+            // like a discard failure, fail-closed, never silently
+            // downgraded to `NoTpmPresent`.
+            TpmPresence::PresentButUnavailable => {
+                drop(tpm);
+                drop(guard);
+                tracing::error!(
+                    "TPM hardware detected but its resource-manager device node is \
+                     unavailable — aborting the claim (fail-closed, box remains unclaimed, \
+                     never recorded as NoTpmPresent)"
+                );
+                return Err(AppError::Internal(
+                    "tpm present but resource manager unavailable".to_string(),
+                ));
+            }
+        }
+    };
+
     let owner_pubkey_b64 = data_encoding::BASE64.encode(&client_pubkey_bytes);
     let claimed_at_ms = now_ms();
 
@@ -464,6 +514,7 @@ pub async fn local_claim_finish(
         owner_pubkey_b64.clone(),
         state.device_name.clone(),
         claimed_at_ms,
+        tpm_custody,
     );
     if let Err(e) = state::persist_local_account_binding(&state.state_dir, &binding) {
         tracing::error!(error = %e, "claimed, but failed to persist the local account binding");
@@ -514,7 +565,18 @@ mod tests {
     /// that file's presence/absence, so it has to genuinely exist on disk
     /// the same way it would in production, not just live in
     /// `AppState::secret`.
+    /// Default: no TPM present, matching this dev/test environment (no
+    /// `/dev/tpmrm0`, no `swtpm`) — see [`test_state_with_tpm`] for tests
+    /// that need a specific TPM presence/outcome.
     fn test_state(dir: PathBuf, rate_limit: u32) -> Arc<AppState> {
+        test_state_with_tpm(dir, rate_limit, crate::tpm::MockTpm::absent())
+    }
+
+    fn test_state_with_tpm(
+        dir: PathBuf,
+        rate_limit: u32,
+        tpm: impl crate::tpm::TpmLockout + 'static,
+    ) -> Arc<AppState> {
         let secret = crate::secret::load_or_create_secret(&dir).expect("test secret");
         Arc::new(AppState {
             keypair: DeviceKeypair::generate(),
@@ -526,6 +588,7 @@ mod tests {
             state_dir: dir,
             rate_limiter: RateLimiter::new(rate_limit),
             pair_claimer: Box::new(MockPairClaimer::claim_err(FabricError::NotConnected)),
+            tpm: Mutex::new(Box::new(tpm)),
         })
     }
 
@@ -991,6 +1054,271 @@ mod tests {
             binding.owner_pubkey.as_deref(),
             Some(data_encoding::BASE64.encode(&winner_pubkey).as_str())
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // -----------------------------------------------------------------
+    // R2: TPM lockout-discard at claim completion
+    // (`context/hot-decisions.md` "Standalone-first identity";
+    // `working-memory-poc/findings/W4-G-key-custody.md`).
+    // -----------------------------------------------------------------
+
+    /// A `TpmLockout` that, at the moment `discard_lockout_auth` is
+    /// called, snapshots whether the box is *already* marked claimed —
+    /// proving the TPM step genuinely runs as part of claim completion,
+    /// not as an afterthought once the box is already committed.
+    struct OrderCheckingTpm {
+        state_dir: PathBuf,
+        ran_before_claimed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl crate::tpm::TpmLockout for OrderCheckingTpm {
+        fn detect(&self) -> crate::tpm::TpmPresence {
+            crate::tpm::TpmPresence::Present
+        }
+
+        fn discard_lockout_auth(&mut self) -> Result<(), crate::tpm::TpmError> {
+            self.ran_before_claimed.store(
+                !state::is_claimed(&self.state_dir),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            Ok(())
+        }
+    }
+
+    /// Small capturing `tracing` writer so a test can assert on what a
+    /// real `RUST_LOG=info` run would actually emit, without adding a
+    /// dev-dependency — `tracing_subscriber` is already a normal
+    /// dependency of this crate (see `main.rs::init_tracing`).
+    #[derive(Clone)]
+    struct CapturingWriter(std::sync::Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("capturing writer lock")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturingWriter {
+        type Writer = CapturingWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// A crude but honest proxy for "no discarded-secret-shaped value is
+    /// present": a run of `threshold`-or-more consecutive hex digits.
+    /// `challenge_id` (a hyphenated UUID) and every base64-encoded field
+    /// this crate logs or persists on the local-claim path break up long
+    /// hex-only runs by construction (hyphens, `+`, `/`, `=`, and letters
+    /// past `f`), so this has no realistic false positives against this
+    /// module's own real log/state output.
+    fn contains_long_hex_run(s: &str, threshold: usize) -> bool {
+        let mut run = 0usize;
+        for c in s.chars() {
+            if c.is_ascii_hexdigit() {
+                run += 1;
+                if run >= threshold {
+                    return true;
+                }
+            } else {
+                run = 0;
+            }
+        }
+        false
+    }
+
+    async fn run_happy_path_finish(
+        state: &Arc<AppState>,
+    ) -> axum::http::Response<axum::body::Body> {
+        let secret = state.secret;
+        let courier = DeviceKeypair::generate();
+        let client_pubkey = courier.public_key_bytes();
+        let (challenge_id, server_nonce, box_pubkey) = real_challenge(state, &client_pubkey).await;
+        let (client_proof, client_sig) =
+            compute_valid_finish(&secret, &courier, &challenge_id, &server_nonce, &box_pubkey);
+        let router = app(Arc::clone(state));
+        let request = json_request(
+            "/v1/onboard/local-claim/finish",
+            serde_json::json!({
+                "challenge_id": challenge_id,
+                "client_pubkey": data_encoding::BASE64.encode(&client_pubkey),
+                "client_proof": client_proof,
+                "client_sig": client_sig,
+            }),
+        );
+        oneshot_with_addr(router, request, lan_addr()).await
+    }
+
+    #[tokio::test]
+    async fn tpm_present_discards_lockout_and_records_it_on_the_claim() {
+        let dir = temp_state_dir();
+        let mock = crate::tpm::MockTpm::present();
+        let counter = mock.discard_call_counter();
+        let state = test_state_with_tpm(dir.clone(), 100, mock);
+
+        let response = run_happy_path_finish(&state).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "discard_lockout_auth must run exactly once for a completed claim"
+        );
+
+        let raw = std::fs::read_to_string(state::local_account_binding_path(&dir)).unwrap();
+        let binding: LocalAccountBinding = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            binding.tpm_custody,
+            Some(crate::local_account_binding::TpmCustodyState::LockoutDiscarded)
+        );
+        // R1: the owner named on the claim record is a person id — never a
+        // household — and there is no delegation grant (no grant store
+        // exists for this crate to write to).
+        assert!(binding.owner_pubkey.is_some());
+        assert!(binding.household_delegation.is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn tpm_absent_records_no_hardware_attempt_limit_and_the_claim_still_succeeds() {
+        let dir = temp_state_dir();
+        let state = test_state_with_tpm(dir.clone(), 100, crate::tpm::MockTpm::absent());
+
+        let response = run_happy_path_finish(&state).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "a box with no TPM is still a valid claim, not a failure"
+        );
+
+        let raw = std::fs::read_to_string(state::local_account_binding_path(&dir)).unwrap();
+        let binding: LocalAccountBinding = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            binding.tpm_custody,
+            Some(crate::local_account_binding::TpmCustodyState::NoTpmPresent)
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn tpm_discard_failure_aborts_the_claim_and_leaves_no_known_lockout_auth() {
+        let dir = temp_state_dir();
+        let mock = crate::tpm::MockTpm::present_but_failing();
+        let counter = mock.discard_call_counter();
+        let state = test_state_with_tpm(dir.clone(), 100, mock);
+
+        let response = run_happy_path_finish(&state).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a TPM present but failing to discard lockoutAuth must abort the claim (fail-closed)"
+        );
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Fail-closed: the box is NOT claimed, so there is no claim record
+        // — known-lockoutAuth or otherwise — to leave behind. The secret
+        // is still present too (this failure is not a proof failure, so
+        // §9hh's "a typo must not burn onboarding" posture extends here:
+        // the box can simply be claimed again once the TPM issue clears).
+        assert!(
+            !state::is_claimed(&dir),
+            "a claim failure path must not leave the box claimed"
+        );
+        assert!(
+            !state::local_account_binding_path(&dir).exists(),
+            "a claim failure path must not persist a claim record at all"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// CA-4 (Wave C security review): "TPM hardware present but this
+    /// backend can't reach it" must abort the claim exactly like a discard
+    /// failure — never fall through to `discard_lockout_auth` at all
+    /// (which would be pointless against an unreachable device), and never
+    /// silently record `NoTpmPresent`.
+    #[tokio::test]
+    async fn tpm_present_but_unavailable_aborts_the_claim_and_never_calls_discard() {
+        let dir = temp_state_dir();
+        let mock = crate::tpm::MockTpm::present_but_unavailable();
+        let counter = mock.discard_call_counter();
+        let state = test_state_with_tpm(dir.clone(), 100, mock);
+
+        let response = run_happy_path_finish(&state).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "hardware detected but unreachable must abort the claim (fail-closed), the same \
+             as a discard failure"
+        );
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "discard_lockout_auth must never even be attempted against an unreachable TPM"
+        );
+        assert!(!state::is_claimed(&dir));
+        assert!(!state::local_account_binding_path(&dir).exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn tpm_lockout_discard_runs_before_the_box_is_marked_claimed() {
+        let dir = temp_state_dir();
+        let ran_before_claimed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let tpm = OrderCheckingTpm {
+            state_dir: dir.clone(),
+            ran_before_claimed: ran_before_claimed.clone(),
+        };
+        let state = test_state_with_tpm(dir.clone(), 100, tpm);
+
+        let response = run_happy_path_finish(&state).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            ran_before_claimed.load(std::sync::atomic::Ordering::SeqCst),
+            "lockoutAuth must be discarded before the box is marked claimed"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn tpm_lockout_bytes_never_appear_in_logs_or_persisted_state() {
+        let dir = temp_state_dir();
+        let buf = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(CapturingWriter(buf.clone()))
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let state = test_state_with_tpm(dir.clone(), 100, crate::tpm::MockTpm::present());
+        let response = run_happy_path_finish(&state).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        drop(_guard);
+        let log_output =
+            String::from_utf8_lossy(&buf.lock().expect("capturing writer lock")).to_string();
+        assert!(
+            !contains_long_hex_run(&log_output, 32),
+            "log output must never contain a byte-shaped run resembling a discarded \
+             lockoutAuth value:\n{log_output}"
+        );
+
+        let binding_raw = std::fs::read_to_string(state::local_account_binding_path(&dir)).unwrap();
+        assert!(!contains_long_hex_run(&binding_raw, 32));
+        let claimed_raw = std::fs::read_to_string(dir.join("claimed")).unwrap();
+        assert!(!contains_long_hex_run(&claimed_raw, 32));
 
         std::fs::remove_dir_all(&dir).ok();
     }

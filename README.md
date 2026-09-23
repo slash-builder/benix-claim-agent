@@ -654,10 +654,14 @@ stages exactly, including the `-u root:root` fix from PR #2 for the
   case-insensitivity (upper/lower/mixed), separator/whitespace tolerance,
   Crockford's own `O`/`I`/`L` decode leniency, and rejection of both
   wrong-length and out-of-alphabet input.
-- `local_account_binding`: the existing hub-mediated `new_active` round
-  trip (now also asserting `owner_pubkey` is `None` there), plus
-  `new_active_local` recording `owner_pubkey` as both that field and
-  `principal_id`.
+- `local_account_binding`: `new_active_local` recording `owner_pubkey` as
+  both that field and `principal_id`, TPM custody recording, and
+  `record_hub_join` (CA-6, Wave C security review) touching only
+  `hub_device_id` and leaving `owner_pubkey`/`principal_id`/`tpm_custody`/
+  `household_delegation` untouched — the hub-mediated path's own
+  `new_active` fresh-binding constructor was removed with that fix, since
+  a hub join is now a read-modify-write onto the local claim's binding,
+  never a fresh mint of its own.
 - `local_claim` (router-level, same `tower::ServiceExt::oneshot` pattern as
   `handlers`'s own test module):
   - happy-path round trip: `challenge` → `finish` → `200 claimed`,
