@@ -35,7 +35,6 @@ use fabric_kit::PairOutcome;
 use serde::{Deserialize, Serialize};
 
 use crate::error::AppError;
-use crate::local_account_binding::LocalAccountBinding;
 use crate::qr_payload;
 use crate::state;
 use crate::AppState;
@@ -271,6 +270,7 @@ pub async fn healthz() -> impl IntoResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::local_account_binding::LocalAccountBinding;
     use crate::net::is_lan_source;
     use crate::pairing::MockPairClaimer;
     use crate::ratelimit::RateLimiter;

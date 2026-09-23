@@ -489,29 +489,69 @@ mod tests {
         assert_eq!(msg, "tpm lockout changeauth failed");
     }
 
-    #[test]
-    fn system_tpm_absent_device_node_reports_absence() {
-        // SystemTpm::new() points at /dev/tpmrm0 plus the sysfs/raw
-        // hardware-signal nodes; this environment (a Mac, no TPM at all)
-        // has none of them, so detect() must honestly report absence
-        // rather than guessing present or unavailable. Confirms the real
-        // backend's read-only detect path is safe to construct and call
-        // even off-hardware.
-        assert_eq!(SystemTpm::new().detect(), TpmPresence::Absent);
-    }
-
-    #[test]
-    fn system_tpm_reports_present_but_unavailable_when_only_hardware_signals_exist() {
-        // CA-4's own regression test: a resource-manager node that isn't
-        // there, but a hardware-signal node that is, must never collapse
-        // to `Absent`. Uses this OS's real filesystem (a tempfile standing
-        // in for "/dev/tpm0", not real hardware) rather than adding a
-        // dependency-injection seam SystemTpm doesn't otherwise need.
+    /// A fresh, empty temp directory this test owns exclusively — every
+    /// hermetic `detect()` test below builds its `SystemTpm` fixture from
+    /// paths under here, never from `SystemTpm::new()`'s own hardcoded
+    /// `/dev/tpmrm0`/`/sys/class/tpm/tpm0`/`/dev/tpm0`. **This is the fix
+    /// for a real bug this test module had**: a prior version of
+    /// `system_tpm_absent_device_node_reports_absence` called
+    /// `SystemTpm::new().detect()` directly against the real host
+    /// filesystem, which made the test's outcome depend on whether the
+    /// *machine running the test* has a TPM — it silently assumed no TPM,
+    /// passed on this session's own TPM-less Mac, and **failed on venus**
+    /// (a real Linux box where `/sys/class/tpm/tpm0` is visible even
+    /// inside the container while `/dev/tpm*` is not, so `detect()`
+    /// correctly, honestly returned `PresentButUnavailable` — the test was
+    /// wrong, not the code).
+    fn tpm_fixture_dir() -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "benix-claim-agent-tpm-test-{}",
             uuid::Uuid::new_v4()
         ));
         std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn system_tpm_detect_reports_absent_when_nothing_exists() {
+        // No resource-manager node, no hardware-signal node — every path
+        // under this fixture's own empty temp dir, guaranteed absent
+        // regardless of what the host machine actually has.
+        let dir = tpm_fixture_dir();
+        let tpm = SystemTpm {
+            resource_manager_node: dir.join("tpmrm0-does-not-exist"),
+            hardware_signal_nodes: vec![dir.join("tpm0-does-not-exist")],
+        };
+        assert_eq!(tpm.detect(), TpmPresence::Absent);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn system_tpm_detect_reports_present_when_the_resource_manager_node_opens() {
+        // A real file standing in for a real, accessible /dev/tpmrm0 —
+        // detect() only needs to open it read+write, which a plain file
+        // satisfies just as well as a character device for this test's
+        // purposes.
+        let dir = tpm_fixture_dir();
+        let resource_manager_node = dir.join("tpmrm0");
+        std::fs::write(&resource_manager_node, b"").unwrap();
+
+        let tpm = SystemTpm {
+            resource_manager_node,
+            hardware_signal_nodes: vec![dir.join("tpm0-does-not-exist")],
+        };
+        assert_eq!(tpm.detect(), TpmPresence::Present);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn system_tpm_detect_reports_present_but_unavailable_when_only_hardware_signals_exist() {
+        // CA-4's own regression test: a resource-manager node that isn't
+        // there, but a hardware-signal node that is, must never collapse
+        // to `Absent`.
+        let dir = tpm_fixture_dir();
         let hardware_signal = dir.join("tpm0");
         std::fs::write(&hardware_signal, b"").unwrap();
 
@@ -522,6 +562,47 @@ mod tests {
         assert_eq!(tpm.detect(), TpmPresence::PresentButUnavailable);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn system_tpm_detect_reports_present_but_unavailable_when_the_node_cannot_be_opened() {
+        // CA-4's other real-world case: the resource-manager node exists
+        // but this process can't open it the way it needs
+        // (`.read(true).write(true)`) — permission-denied on real
+        // hardware. A directory at that path is the portable way to
+        // provoke an "exists, but opening for read+write fails" error
+        // without depending on DAC permission bits, which CI or a manual
+        // run as root would simply bypass (Jenkins' own Docker Pipeline
+        // agent runs as a fixed non-root UID 5005 per this repo's
+        // Jenkinsfile, but this test shouldn't depend on that to stay
+        // meaningful under every runner). Opening a directory for
+        // read+write fails with `Is a directory` regardless of privilege
+        // level, on every OS this backend targets.
+        let dir = tpm_fixture_dir();
+        let resource_manager_node = dir.join("tpmrm0-is-a-directory");
+        std::fs::create_dir_all(&resource_manager_node).unwrap();
+
+        let tpm = SystemTpm {
+            resource_manager_node,
+            hardware_signal_nodes: vec![dir.join("tpm0-does-not-exist")],
+        };
+        assert_eq!(tpm.detect(), TpmPresence::PresentButUnavailable);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **Real-hardware/real-host test, deliberately separate from the
+    /// hermetic ones above and not run by default (`#[ignore]`).** Exactly
+    /// what `SystemTpm::new()` would decide on whatever machine actually
+    /// runs it — informational for a manual check on venus or any other
+    /// real box, never a CI assertion (a CI agent may or may not have a
+    /// TPM, and either answer is a legitimate pass here). Run explicitly
+    /// with `cargo test -- --ignored system_tpm_new_reflects_this_host`.
+    #[test]
+    #[ignore]
+    fn system_tpm_new_reflects_this_host() {
+        let presence = SystemTpm::new().detect();
+        println!("SystemTpm::new().detect() on this host: {presence:?}");
     }
 
     /// **CA-1b's own required regression test.** Spawns a real (harmless)
